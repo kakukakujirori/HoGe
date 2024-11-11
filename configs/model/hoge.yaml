@@ -1,0 +1,39 @@
+_target_: src.models.hoge_module.HoGeModule
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.00001
+  weight_decay: 0.0
+  betas: [0.9, 0.9]
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _partial_: true
+  T_max: ${trainer.max_epochs}
+  eta_min: 1e-7
+
+net:
+  _target_: src.models.components.hoge_model.HoGeModel
+  encoder: dinov2_vitl14
+  intermediate_layers: 4
+  dim_proj: 512
+  dim_upsample: [256, 128, 64]
+  dim_times_res_block_hidden: 2
+  num_res_blocks: 2
+  max_points_per_ray: 3
+  output_color: true
+  output_conf: true
+  res_block_norm: group_norm
+  trained_diagonal_size_range: [600, 900]
+  trained_area_range: [250000, 500000]
+  last_res_blocks: 0
+  last_conv_channels: 32
+  last_conv_size: 1
+
+criterion_list:
+  - _target_: src.models.losses.l2_loss.L2Loss
+    weight: 0.0
+
+# compile model for faster training with pytorch 2.0
+compile: true

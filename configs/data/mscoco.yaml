@@ -1,0 +1,20 @@
+_target_: src.data.single_image_datamodule.SingleImageDataModule
+train_data_dir: /media/ryotaro/ssd1/MSCOCO/train2017
+val_data_dir: /media/ryotaro/ssd1/MSCOCO/val2017
+test_data_dir: null
+width: 512
+height: 512
+augmentation_list:
+  - _target_: albumentations.ColorJitter
+    brightness: [0.8, 1.2]
+    contrast: [0.8, 1.2]
+    saturation: [0.8, 1.2]
+    hue: [-0.0, 0.0]
+  - _target_: albumentations.GaussianBlur
+    blur_limit: [3, 7]
+  - _target_: albumentations.ImageCompression
+  # - _target_: albumentations.RandomResizedCrop
+  #   scale: [0.8, 1.0]
+batch_size: 2 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+num_workers: 4
+pin_memory: True
