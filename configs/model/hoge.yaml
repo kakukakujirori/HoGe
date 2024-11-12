@@ -32,8 +32,8 @@ net:
   last_conv_size: 1
 
 criterion_list:
-  - _target_: src.models.losses.l2_loss.L2Loss
-    weight: 0.0
+  - _target_: src.models.losses.toy_loss.ToyLoss
+    weight: 1.0
 
 # compile model for faster training with pytorch 2.0
 compile: true

@@ -65,14 +65,18 @@ class HoGeModule(LightningModule):
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(logger=False)
+        self.save_hyperparameters(ignore=['net'], logger=False)
 
         self.camera_configurator = ConfigureCamera()
-        self.mesh_generator = MoGeMesh(background_alpha=1.0)  # NOTE: When processing with HoGe, sky region is a 'valid' region
+        self.mesh_generator = MoGeMesh(background_alpha=0.75)  # NOTE: When processing with HoGe, sky region is a 'valid' region, but an 'invalid' region when calculating render_masks
         self.mesh_renderer = RenderMesh(layer_num=net.max_points_per_ray, void_alpha=0.0)
-        self.net = net
+
+        # freeze MoGeMesh weights
+        for param in self.mesh_generator.parameters():
+            param.requires_grad = False
 
         # load MoGe weight
+        self.net = net
         self.net.load_pretrained_moge()
 
         # loss functions
@@ -92,6 +96,11 @@ class HoGeModule(LightningModule):
             self,
             image: Float[torch.Tensor, "b h w c"],
         ) -> tuple[Float[torch.Tensor, "b h w layers 4"], Float[torch.Tensor, "b h w layers 3"], Float[torch.Tensor, "b h w 3"]]:
+        # just in case
+        self.mesh_generator.eval()
+        self.camera_configurator.eval()
+        self.mesh_renderer.eval()
+
         batch, height, width, channel = image.shape
         assert channel == 3, f"{image.shape=}"
         intrinsics, meshes, points_original = self.mesh_generator(image)  # (b, 3, 3), Meshes, (b, h, w, 3)
@@ -110,13 +119,14 @@ class HoGeModule(LightningModule):
         # generate pseudo GT and inputs
         texels_rendered, points_rendered, points_original = self.generate_pseudo_gt(image_original)
         image_rendered = texels_rendered[:, :, :, 0, :3]
-        invalid_mask_rendered = texels_rendered[:, :, :, 0, 3] < 0.99
+        invalid_mask_rendered = texels_rendered[:, :, :, 0, 3] < 0.9  # NOTE: sky region should be 'invalid'
 
         input_dict = {
             "image_original" : image_original,  # (b, h, w, 3)
             "points_original" : points_original,  # (b, h, w, 3)
             "texels_rendered": texels_rendered,  # (b, h, w, layers, 4)
             "points_rendered": points_rendered,  # (b, h, w, layers, 3)
+            "masks_rendered": ~invalid_mask_rendered, # (b, h, w)
         }
 
         # HoGe inference
@@ -126,11 +136,10 @@ class HoGeModule(LightningModule):
         )
 
         # calculate losses
-        print("[HoGeModel] model_step: loss not defined!!!")
         loss_dict = {}
         for loss_func in self.criterion_list:
             loss_key = type(loss_func).__name__
-            loss_val = output_dict["points"].mean()  # loss_func(output_dict, points_rendered)
+            loss_val = loss_func(input_dict, output_dict)
             loss_dict[loss_key] = loss_val
         loss_dict["total_loss"] = sum(loss_dict.values())
 
@@ -150,8 +159,8 @@ class HoGeModule(LightningModule):
             self.log(
                 f"train/{loss_key}",
                 loss_val,
-                on_step=False,
-                on_epoch=True,
+                on_step=True,
+                on_epoch=False,
                 prog_bar=True,
                 sync_dist=True,
             )

@@ -99,8 +99,8 @@ class RenderMesh(torch.nn.Module):
         alpha = opening(alpha, torch.ones(5, 5, device=alpha.device))
         alpha = rearrange(alpha, "(b layers) () h w -> b h w layers", b=batch_size)
 
-        # detect void layers
-        alpha_valid_ratio = (alpha > 0.5).float().mean(dim=(1, 2))
+        # detect void layers (NOTE: sky region should be treated as valid)
+        alpha_valid_ratio = (alpha > 0.1).float().mean(dim=(1, 2))
         void_layer_indices = (alpha_valid_ratio < alpha_valid_area_thresh).nonzero(as_tuple=True)
 
         # detect duplication layers

@@ -28,3 +28,4 @@ einops
 jaxtyping
 kornia
 utils3d
+git+https://github.com/facebookresearch/pytorch3d.git
