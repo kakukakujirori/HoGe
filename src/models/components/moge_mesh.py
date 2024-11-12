@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import utils3d
 
 from jaxtyping import Float
@@ -13,7 +14,7 @@ from thirdparty.MoGe.moge.model import MoGeModel
 class MoGeMesh(torch.nn.Module):
     def __init__(
         self,
-        depth_edge_thresh: float = 0.02,
+        depth_edge_thresh: float = 0.05,  # higher than the original to circumvent 'all depth edge' phenomenon in outdoor scenes
         invalid_mesh_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
         valid_alpha: float = 1.0,
         background_alpha: float = 1.0,   # NOTE: When processing with HoGe, sky region is a 'valid' region
@@ -63,7 +64,7 @@ class MoGeMesh(torch.nn.Module):
         K[:, 2, 2] = 1
 
         # mark invalid mesh faces
-        depth_edge = utils3d.torch.depth_edge(depth, rtol=self.depth_edge_thresh, mask=mask)  # (B, H, W)
+        depth_edge = calc_depth_edge(depth, rtol=self.depth_edge_thresh, mask=mask)  # (B, H, W)
         image_ch_last[depth_edge, :] = torch.tensor(self.invalid_mesh_color, dtype=dtype, device=device).reshape(1, 3)
 
         # construct meshes (visible=1, background=self.background_alpha, invalid=self.invalid_alpha)
@@ -232,6 +233,37 @@ def image_mesh(
             *(x.reshape(-1, *x.shape[2:]) for x in image_attrs),
             return_indices=return_indices
         )
+
+
+def calc_depth_edge(depth: torch.Tensor, atol: float = None, rtol: float = None, kernel_size: int = 3, mask: torch.Tensor = None) -> torch.BoolTensor:
+    """
+    Compute the edge mask of a depth map. The edge is defined as the pixels whose neighbors have a large difference in depth.
+
+    Args:
+        depth (torch.Tensor): shape (..., height, width), linear depth map
+        atol (float): absolute tolerance
+        rtol (float): relative tolerance
+
+    Returns:
+        edge (torch.Tensor): shape (..., height, width) of dtype torch.bool
+    """
+    shape = depth.shape
+    depth = depth.reshape(-1, 1, *shape[-2:])
+    if mask is not None:
+        mask = mask.reshape(-1, 1, *shape[-2:])
+
+    if mask is None:
+        diff = (F.max_pool2d(depth, kernel_size, stride=1, padding=kernel_size // 2) + F.max_pool2d(-depth, kernel_size, stride=1, padding=kernel_size // 2))
+    else:  # NOTE: Modified from the original (not -torch.inf but +torch.inf in the first term)
+        diff = (F.max_pool2d(torch.where(mask, depth, torch.inf), kernel_size, stride=1, padding=kernel_size // 2) + F.max_pool2d(torch.where(mask, -depth, -torch.inf), kernel_size, stride=1, padding=kernel_size // 2))
+
+    edge = torch.zeros_like(depth, dtype=torch.bool)
+    if atol is not None:
+        edge |= diff > atol
+    if rtol is not None:
+        edge |= (diff / depth).nan_to_num_() > rtol
+    edge = edge.reshape(*shape)
+    return edge
 
 
 if __name__ == "__main__":

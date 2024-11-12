@@ -87,7 +87,7 @@ class RenderMesh(torch.nn.Module):
             self,
             texels: Float[torch.Tensor, "b h w layers 4"],
             depths: Float[torch.Tensor, "b h w layers"],
-            alpha_valid_area_thresh: float = 0.01,
+            alpha_valid_area_thresh: float = 0.005,
             alpha_duplication_thresh: float = 0.99,
         ) -> tuple[Float[torch.Tensor, "b h w layers 4"], Float[torch.Tensor, "b h w layers"]]:
 
@@ -149,4 +149,5 @@ class RenderMesh(torch.nn.Module):
         ) -> tuple[Float[torch.Tensor, "b h w layers 4"], Float[torch.Tensor, "b h w layers"]]:
         texels, depths = self.render(meshes, cameras)
         texels, depths = self.cull_redundant_layers(texels, depths)
+        depths[texels[..., 3] < 0.5] = -1  # mask invalid depth as well
         return texels, depths

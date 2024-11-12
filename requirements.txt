@@ -24,5 +24,7 @@ rich            # beautiful text formatting in terminal
 pytest          # tests
 # sh            # for running bash commands in some tests (linux/macos only)
 albumentations
+einops
+jaxtyping
 kornia
 utils3d
