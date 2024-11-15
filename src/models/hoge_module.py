@@ -122,8 +122,8 @@ class HoGeModule(LightningModule):
         invalid_mask_rendered = texels_rendered[:, :, :, 0, 3] < 0.9  # NOTE: sky region should be 'invalid'
 
         input_dict = {
-            "image_original" : image_original,  # (b, h, w, 3)
-            "points_original" : points_original,  # (b, h, w, 3)
+            "image_original": image_original,  # (b, h, w, 3)
+            "points_original": points_original,  # (b, h, w, 3)
             "texels_rendered": texels_rendered,  # (b, h, w, layers, 4)
             "points_rendered": points_rendered,  # (b, h, w, layers, 3)
             "masks_rendered": ~invalid_mask_rendered, # (b, h, w)
@@ -140,7 +140,11 @@ class HoGeModule(LightningModule):
         for loss_func in self.criterion_list:
             loss_key = type(loss_func).__name__
             loss_val = loss_func(input_dict, output_dict)
-            loss_dict[loss_key] = loss_val
+            if isinstance(loss_val, dict):
+                for key, val in loss_val.items():
+                    loss_dict[f"{loss_key}[{key}]"] = val
+            else:
+                loss_dict[loss_key] = loss_val
         loss_dict["total_loss"] = sum(loss_dict.values())
 
         return loss_dict, input_dict, output_dict
@@ -298,6 +302,7 @@ class HoGeModule(LightningModule):
         :param stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
         """
         if self.hparams.compile and stage == "fit":
+            self.mesh_generator.moge = torch.compile(self.mesh_generator.moge)
             self.net = torch.compile(self.net)
 
     def configure_optimizers(self) -> Dict[str, Any]:
