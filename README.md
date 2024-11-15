@@ -13,7 +13,7 @@
 
 ## Description
 
-MoGe extention to infer occluded point clouds
+MoGe extension to infer occluded point clouds
 
 ## Installation
 

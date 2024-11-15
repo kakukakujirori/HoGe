@@ -117,7 +117,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     extras(cfg)
 
     # miscs
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision("high")
 
     # train the model
     metric_dict, _ = train(cfg)

@@ -131,12 +131,16 @@ class SingleImageDataModule(LightningDataModule):
             print("[SingleImageDataModule] WARNING: dynamic_batch_collate not yet implemented!!!")
             self.dynamic_collate_unimplemented_warning_flag = True
 
-        batch = [cv2.resize(img_t.numpy(), (self.hparams.width, self.hparams.height)) for img_t in batch]
+        batch = [
+            cv2.resize(img_t.numpy(), (self.hparams.width, self.hparams.height)) for img_t in batch
+        ]
         batch = [torch.tensor(img) for img in batch]
         return torch.utils.data.default_collate(batch)
 
     def static_batch_collate(self, batch: list[torch.Tensor]):
-        batch = [cv2.resize(img_t.numpy(), (self.hparams.width, self.hparams.height)) for img_t in batch]
+        batch = [
+            cv2.resize(img_t.numpy(), (self.hparams.width, self.hparams.height)) for img_t in batch
+        ]
         batch = [torch.tensor(img) for img in batch]
         return torch.utils.data.default_collate(batch)
 

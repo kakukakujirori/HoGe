@@ -1,10 +1,9 @@
-from typing import Any, Dict, Tuple
 import os
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
 import utils3d
-
 from einops import rearrange
 from jaxtyping import Float
 from lightning import LightningModule
@@ -65,10 +64,12 @@ class HoGeModule(LightningModule):
 
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
-        self.save_hyperparameters(ignore=['net'], logger=False)
+        self.save_hyperparameters(ignore=["net"], logger=False)
 
         self.camera_configurator = ConfigureCamera()
-        self.mesh_generator = MoGeMesh(background_alpha=0.75)  # NOTE: When processing with HoGe, sky region is a 'valid' region, but an 'invalid' region when calculating render_masks
+        self.mesh_generator = MoGeMesh(
+            background_alpha=0.75
+        )  # NOTE: When processing with HoGe, sky region is a 'valid' region, but an 'invalid' region when calculating render_masks
         self.mesh_renderer = RenderMesh(layer_num=net.max_points_per_ray, void_alpha=0.0)
 
         # freeze MoGeMesh weights
@@ -82,7 +83,9 @@ class HoGeModule(LightningModule):
         # loss functions
         self.criterion_list = torch.nn.ModuleList(criterion_list)
 
-    def forward(self, image: Float[torch.Tensor, "b c h w"], invalid_mask: Float[torch.Tensor, "b c h w"]) -> dict[str, torch.Tensor]:
+    def forward(
+        self, image: Float[torch.Tensor, "b c h w"], invalid_mask: Float[torch.Tensor, "b c h w"]
+    ) -> dict[str, torch.Tensor]:
         return self.net(image, invalid_mask)
 
     def on_train_start(self) -> None:
@@ -93,9 +96,13 @@ class HoGeModule(LightningModule):
 
     @torch.inference_mode()
     def generate_pseudo_gt(
-            self,
-            image: Float[torch.Tensor, "b h w c"],
-        ) -> tuple[Float[torch.Tensor, "b h w layers 4"], Float[torch.Tensor, "b h w layers 3"], Float[torch.Tensor, "b h w 3"]]:
+        self,
+        image: Float[torch.Tensor, "b h w c"],
+    ) -> tuple[
+        Float[torch.Tensor, "b h w layers 4"],
+        Float[torch.Tensor, "b h w layers 3"],
+        Float[torch.Tensor, "b h w 3"],
+    ]:
         # just in case
         self.mesh_generator.eval()
         self.camera_configurator.eval()
@@ -103,15 +110,29 @@ class HoGeModule(LightningModule):
 
         batch, height, width, channel = image.shape
         assert channel == 3, f"{image.shape=}"
-        intrinsics, meshes, points_original = self.mesh_generator(image)  # (b, 3, 3), Meshes, (b, h, w, 3)
+        intrinsics, meshes, points_original = self.mesh_generator(
+            image
+        )  # (b, 3, 3), Meshes, (b, h, w, 3)
         camera = self.camera_configurator(intrinsics, image, points_original)
-        texels_rendered, depths_rendered = self.mesh_renderer(meshes, camera)  # (b, h, w, layers, 4), (b, h, w, layers)
+        texels_rendered, depths_rendered = self.mesh_renderer(
+            meshes, camera
+        )  # (b, h, w, layers, 4), (b, h, w, layers)
 
         # unproject depths_rendered to points_rendered
-        uv_coord = utils3d.torch.image_uv(width=width, height=height, dtype=image.dtype, device=image.device)
+        uv_coord = utils3d.torch.image_uv(
+            width=width, height=height, dtype=image.dtype, device=image.device
+        )
         points_rendered = torch.cat([uv_coord, torch.ones_like(uv_coord[..., :1])], dim=-1)
-        points_rendered = points_rendered @ torch.inverse(intrinsics.reshape(batch, 1, 3, 3)).transpose(-2, -1)  # (h, w, 3) @ (b, 1, 3, 3) => (b, h, w, 3)
-        points_rendered = points_rendered.reshape(batch, height, width, 1, 3) * depths_rendered.reshape(batch, height, width, -1, 1)  # (b, h, w, 1, 3) * (b, h, w, layers, 1) => (b, h, w, layers, 3)
+        points_rendered = points_rendered @ torch.inverse(
+            intrinsics.reshape(batch, 1, 3, 3)
+        ).transpose(
+            -2, -1
+        )  # (h, w, 3) @ (b, 1, 3, 3) => (b, h, w, 3)
+        points_rendered = points_rendered.reshape(
+            batch, height, width, 1, 3
+        ) * depths_rendered.reshape(
+            batch, height, width, -1, 1
+        )  # (b, h, w, 1, 3) * (b, h, w, layers, 1) => (b, h, w, layers, 3)
 
         return texels_rendered, points_rendered, points_original
 
@@ -119,14 +140,16 @@ class HoGeModule(LightningModule):
         # generate pseudo GT and inputs
         texels_rendered, points_rendered, points_original = self.generate_pseudo_gt(image_original)
         image_rendered = texels_rendered[:, :, :, 0, :3]
-        invalid_mask_rendered = texels_rendered[:, :, :, 0, 3] < 0.9  # NOTE: sky region should be 'invalid'
+        invalid_mask_rendered = (
+            texels_rendered[:, :, :, 0, 3] < 0.9
+        )  # NOTE: sky region should be 'invalid'
 
         input_dict = {
             "image_original": image_original,  # (b, h, w, 3)
             "points_original": points_original,  # (b, h, w, 3)
             "texels_rendered": texels_rendered,  # (b, h, w, layers, 4)
             "points_rendered": points_rendered,  # (b, h, w, layers, 3)
-            "masks_rendered": ~invalid_mask_rendered, # (b, h, w)
+            "masks_rendered": ~invalid_mask_rendered,  # (b, h, w)
         }
 
         # HoGe inference
@@ -270,7 +293,6 @@ class HoGeModule(LightningModule):
         depth_pred = rearrange(output_points[..., 2], "h w samples -> samples h w")
         depth_pred = (depth_pred - depth_pred.min()) / (depth_pred.max() - depth_pred.min())
         depth_pred = torch.clip(255 * depth_pred, 0, 255).to(torch.uint8).cpu().numpy()
-
 
         if isinstance(self.logger, WandbLogger):
             self.logger.log_image(

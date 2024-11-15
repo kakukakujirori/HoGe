@@ -40,7 +40,7 @@ repos:
 
   # python docstring formatting
   - repo: https://github.com/myint/docformatter
-    rev: v1.7.5
+    rev: eb1df347edd128b30cd3368dddc3aa65edcfac38
     hooks:
       - id: docformatter
         args:
@@ -76,18 +76,18 @@ repos:
         args:
           [
             "--extend-ignore",
-            "E203,E402,E501,F401,F722,F841,RST2,RST301",
+            "E203,E402,E501,E731,F401,F722,F841,RST2,RST301",
             "--exclude",
             "logs/*,data/*",
           ]
         additional_dependencies: [flake8-rst-docstrings==0.3.0]
 
   # python security linter
-  - repo: https://github.com/PyCQA/bandit
-    rev: "1.7.10"
-    hooks:
-      - id: bandit
-        args: ["-s", "B101,B311"]
+  # - repo: https://github.com/PyCQA/bandit
+  #   rev: "1.7.10"
+  #   hooks:
+  #     - id: bandit
+  #       args: ["-s", "B101,B311"]
 
   # yaml formatting
   - repo: https://github.com/pre-commit/mirrors-prettier

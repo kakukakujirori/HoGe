@@ -1,10 +1,10 @@
-from typing import *
-from numbers import Number
-from functools import partial
-from pathlib import Path
 import importlib
-import warnings
 import json
+import warnings
+from functools import partial
+from numbers import Number
+from pathlib import Path
+from typing import IO, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -16,39 +16,63 @@ from einops import rearrange
 from huggingface_hub import hf_hub_download
 
 from src.models.components.dinov2.models.vision_transformer import DinoVisionTransformer
-from src.models.components.geometry_torch import image_plane_uv, point_map_to_depth, gaussian_blur_2d
-from src.models.components.utils import wrap_dinov2_attention_with_sdpa, wrap_module_with_gradient_checkpointing, unwrap_module_with_gradient_checkpointing
+from src.models.components.geometry_torch import (
+    gaussian_blur_2d,
+    image_plane_uv,
+    point_map_to_depth,
+)
+from src.models.components.utils import (
+    unwrap_module_with_gradient_checkpointing,
+    wrap_dinov2_attention_with_sdpa,
+    wrap_module_with_gradient_checkpointing,
+)
 
 
 class ResidualConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int = None, hidden_channels: int = None, padding_mode: str = 'replicate', activation: Literal['relu', 'leaky_relu', 'silu', 'elu'] = 'relu', norm: Literal['group_norm', 'layer_norm'] = 'group_norm'):
-        super(ResidualConvBlock, self).__init__()
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int = None,
+        hidden_channels: int = None,
+        padding_mode: str = "replicate",
+        activation: Literal["relu", "leaky_relu", "silu", "elu"] = "relu",
+        norm: Literal["group_norm", "layer_norm"] = "group_norm",
+    ):
+        super().__init__()
         if out_channels is None:
             out_channels = in_channels
         if hidden_channels is None:
             hidden_channels = in_channels
 
-        if activation =='relu':
+        if activation == "relu":
             activation_cls = lambda: nn.ReLU(inplace=True)
-        elif activation == 'leaky_relu':
+        elif activation == "leaky_relu":
             activation_cls = lambda: nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        elif activation =='silu':
+        elif activation == "silu":
             activation_cls = lambda: nn.SiLU(inplace=True)
-        elif activation == 'elu':
+        elif activation == "elu":
             activation_cls = lambda: nn.ELU(inplace=True)
         else:
-            raise ValueError(f'Unsupported activation function: {activation}')
+            raise ValueError(f"Unsupported activation function: {activation}")
 
         self.layers = nn.Sequential(
             nn.GroupNorm(1, in_channels),
             activation_cls(),
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, padding_mode=padding_mode),
-            nn.GroupNorm(hidden_channels // 32 if norm == 'group_norm' else 1, hidden_channels),
+            nn.Conv2d(
+                in_channels, hidden_channels, kernel_size=3, padding=1, padding_mode=padding_mode
+            ),
+            nn.GroupNorm(hidden_channels // 32 if norm == "group_norm" else 1, hidden_channels),
             activation_cls(),
-            nn.Conv2d(hidden_channels, out_channels, kernel_size=3, padding=1, padding_mode=padding_mode)
+            nn.Conv2d(
+                hidden_channels, out_channels, kernel_size=3, padding=1, padding_mode=padding_mode
+            ),
         )
 
-        self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0) if in_channels != out_channels else nn.Identity()
+        self.skip_connection = (
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
 
     def forward(self, x):
         skip = self.skip_connection(x)
@@ -67,44 +91,113 @@ class Head(nn.Module):
         dim_upsample: List[int] = [256, 128, 128],
         dim_times_res_block_hidden: int = 1,
         num_res_blocks: int = 1,
-        res_block_norm: Literal['group_norm', 'layer_norm'] = 'group_norm',
+        res_block_norm: Literal["group_norm", "layer_norm"] = "group_norm",
         last_res_blocks: int = 0,
         last_conv_channels: int = 32,
-        last_conv_size: int = 1
+        last_conv_size: int = 1,
     ):
         super().__init__()
 
-        self.projects = nn.ModuleList([
-            nn.Conv2d(in_channels=dim_in, out_channels=dim_proj, kernel_size=1, stride=1, padding=0,) for _ in range(num_features)
-        ])
+        self.projects = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    in_channels=dim_in,
+                    out_channels=dim_proj,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
+                for _ in range(num_features)
+            ]
+        )
 
-        self.upsample_blocks = nn.ModuleList([
-            nn.Sequential(
-                self._make_upsampler(in_ch + 2, out_ch),
-                *(ResidualConvBlock(out_ch, out_ch, dim_times_res_block_hidden * out_ch, activation="relu", norm=res_block_norm) for _ in range(num_res_blocks))
-            ) for in_ch, out_ch in zip([dim_proj] + dim_upsample[:-1], dim_upsample)
-        ])
+        self.upsample_blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    self._make_upsampler(in_ch + 2, out_ch),
+                    *(
+                        ResidualConvBlock(
+                            out_ch,
+                            out_ch,
+                            dim_times_res_block_hidden * out_ch,
+                            activation="relu",
+                            norm=res_block_norm,
+                        )
+                        for _ in range(num_res_blocks)
+                    ),
+                )
+                for in_ch, out_ch in zip([dim_proj] + dim_upsample[:-1], dim_upsample)
+            ]
+        )
 
-        self.output_block = nn.ModuleList([
-            self._make_output_block(
-                dim_upsample[-1] + 2, dim_out_, dim_times_res_block_hidden, last_res_blocks, last_conv_channels, last_conv_size, res_block_norm,
-            ) for dim_out_ in dim_out
-        ])
+        self.output_block = nn.ModuleList(
+            [
+                self._make_output_block(
+                    dim_upsample[-1] + 2,
+                    dim_out_,
+                    dim_times_res_block_hidden,
+                    last_res_blocks,
+                    last_conv_channels,
+                    last_conv_size,
+                    res_block_norm,
+                )
+                for dim_out_ in dim_out
+            ]
+        )
 
     def _make_upsampler(self, in_channels: int, out_channels: int):
         upsampler = nn.Sequential(
             nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, padding_mode='replicate')
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode="replicate",
+            ),
         )
         upsampler[0].weight.data[:] = upsampler[0].weight.data[:, :, :1, :1]
         return upsampler
 
-    def _make_output_block(self, dim_in: int, dim_out: int, dim_times_res_block_hidden: int, last_res_blocks: int, last_conv_channels: int, last_conv_size: int, res_block_norm: Literal['group_norm', 'layer_norm']):
+    def _make_output_block(
+        self,
+        dim_in: int,
+        dim_out: int,
+        dim_times_res_block_hidden: int,
+        last_res_blocks: int,
+        last_conv_channels: int,
+        last_conv_size: int,
+        res_block_norm: Literal["group_norm", "layer_norm"],
+    ):
         return nn.Sequential(
-            nn.Conv2d(dim_in, last_conv_channels, kernel_size=3, stride=1, padding=1, padding_mode='replicate'),
-            *(ResidualConvBlock(last_conv_channels, last_conv_channels, dim_times_res_block_hidden * last_conv_channels, activation='relu', norm=res_block_norm) for _ in range(last_res_blocks)),
+            nn.Conv2d(
+                dim_in,
+                last_conv_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            *(
+                ResidualConvBlock(
+                    last_conv_channels,
+                    last_conv_channels,
+                    dim_times_res_block_hidden * last_conv_channels,
+                    activation="relu",
+                    norm=res_block_norm,
+                )
+                for _ in range(last_res_blocks)
+            ),
             nn.ReLU(inplace=True),
-            nn.Conv2d(last_conv_channels, dim_out, kernel_size=last_conv_size, stride=1, padding=last_conv_size // 2, padding_mode='replicate'),
+            nn.Conv2d(
+                last_conv_channels,
+                dim_out,
+                kernel_size=last_conv_size,
+                stride=1,
+                padding=last_conv_size // 2,
+                padding_mode="replicate",
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor, image: torch.Tensor):
@@ -112,16 +205,25 @@ class Head(nn.Module):
         patch_h, patch_w = img_h // 14, img_w // 14
 
         # Process the hidden states
-        x = torch.stack([
-            proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
+        x = torch.stack(
+            [
+                proj(feat.permute(0, 2, 1).unflatten(2, (patch_h, patch_w)).contiguous())
                 for proj, (feat, clstoken) in zip(self.projects, hidden_states)
-        ], dim=1).sum(dim=1)
+            ],
+            dim=1,
+        ).sum(dim=1)
 
         # Upsample stage
         # (patch_h, patch_w) -> (patch_h * 2, patch_w * 2) -> (patch_h * 4, patch_w * 4) -> (patch_h * 8, patch_w * 8)
         for i, block in enumerate(self.upsample_blocks):
             # UV coordinates is for awareness of image aspect ratio
-            uv = image_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
+            uv = image_plane_uv(
+                width=x.shape[-1],
+                height=x.shape[-2],
+                aspect_ratio=img_w / img_h,
+                dtype=x.dtype,
+                device=x.device,
+            )
             uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
             x = torch.cat([x, uv], dim=1)
             for layer in block:
@@ -129,12 +231,21 @@ class Head(nn.Module):
 
         # (patch_h * 8, patch_w * 8) -> (img_h, img_w)
         x = F.interpolate(x, (img_h, img_w), mode="bilinear", align_corners=False)
-        uv = image_plane_uv(width=x.shape[-1], height=x.shape[-2], aspect_ratio=img_w / img_h, dtype=x.dtype, device=x.device)
+        uv = image_plane_uv(
+            width=x.shape[-1],
+            height=x.shape[-2],
+            aspect_ratio=img_w / img_h,
+            dtype=x.dtype,
+            device=x.device,
+        )
         uv = uv.permute(2, 0, 1).unsqueeze(0).expand(x.shape[0], -1, -1, -1)
         x = torch.cat([x, uv], dim=1)
 
         if isinstance(self.output_block, nn.ModuleList):
-            output = [torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False) for block in self.output_block]
+            output = [
+                torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                for block in self.output_block
+            ]
         else:
             output = torch.utils.checkpoint.checkpoint(self.output_block, x, use_reentrant=False)
 
@@ -145,8 +256,9 @@ class HoGeModel(nn.Module):
     image_mean: torch.Tensor
     image_std: torch.Tensor
 
-    def __init__(self,
-        encoder: str = 'dinov2_vitl14',
+    def __init__(
+        self,
+        encoder: str = "dinov2_vitl14",
         intermediate_layers: Union[int, List[int]] = 4,
         dim_proj: int = 512,
         dim_upsample: List[int] = [256, 128, 64],
@@ -155,14 +267,14 @@ class HoGeModel(nn.Module):
         max_points_per_ray: int = 3,
         output_color: bool = True,
         output_conf: bool = True,
-        res_block_norm: Literal['group_norm', 'layer_norm'] = 'group_norm',
+        res_block_norm: Literal["group_norm", "layer_norm"] = "group_norm",
         trained_diagonal_size_range: Tuple[Number, Number] = (600, 900),
         trained_area_range: Tuple[Number, Number] = (250000, 500000),  # (500 * 500, 700 * 700),
         last_res_blocks: int = 0,
         last_conv_channels: int = 32,
         last_conv_size: int = 1,
     ):
-        super(HoGeModel, self).__init__()
+        super().__init__()
         assert max_points_per_ray >= 1
 
         self.encoder = encoder
@@ -175,7 +287,9 @@ class HoGeModel(nn.Module):
 
         # NOTE: We have copied the DINOv2 code in torchhub to this repository.
         # Minimal modifications have been made: removing irrelevant code, unnecessary warnings and fixing importing issues.
-        hub_loader = getattr(importlib.import_module(".dinov2.hub.backbones", __package__), encoder)
+        hub_loader = getattr(
+            importlib.import_module(".dinov2.hub.backbones", __package__), encoder
+        )
         self.backbone: DinoVisionTransformer = hub_loader(pretrained=False)
         dim_feature = self.backbone.blocks[0].attn.qkv.in_features
 
@@ -186,7 +300,11 @@ class HoGeModel(nn.Module):
             head_dim_out.append(max_points_per_ray)
 
         self.head = Head(
-            num_features=intermediate_layers if isinstance(intermediate_layers, int) else len(intermediate_layers),
+            num_features=(
+                intermediate_layers
+                if isinstance(intermediate_layers, int)
+                else len(intermediate_layers)
+            ),
             dim_in=dim_feature,
             dim_out=head_dim_out,
             dim_proj=dim_proj,
@@ -196,7 +314,7 @@ class HoGeModel(nn.Module):
             res_block_norm=res_block_norm,
             last_res_blocks=last_res_blocks,
             last_conv_channels=last_conv_channels,
-            last_conv_size=last_conv_size
+            last_conv_size=last_conv_size,
         )
 
         image_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -205,13 +323,17 @@ class HoGeModel(nn.Module):
         self.register_buffer("image_mean", image_mean)
         self.register_buffer("image_std", image_std)
 
-        if torch.__version__ >= '2.0':
+        if torch.__version__ >= "2.0":
             self.enable_pytorch_native_sdpa()
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, Path, IO[bytes]], model_kwargs: Optional[Dict[str, Any]] = None, **hf_kwargs) -> 'HoGeModel':
-        """
-        Load a model from a checkpoint file.
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, Path, IO[bytes]],
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        **hf_kwargs,
+    ) -> "HoGeModel":
+        """Load a model from a checkpoint file.
 
         ### Parameters:
         - `pretrained_model_name_or_path`: path to the checkpoint file or repo id.
@@ -222,29 +344,33 @@ class HoGeModel(nn.Module):
         - A new instance of `HoGe` with the parameters loaded from the checkpoint.
         """
         if Path(pretrained_model_name_or_path).exists():
-            checkpoint = torch.load(pretrained_model_name_or_path, map_location='cpu', weights_only=True)
+            checkpoint = torch.load(
+                pretrained_model_name_or_path, map_location="cpu", weights_only=True
+            )
         else:
             cached_checkpoint_path = hf_hub_download(
                 repo_id=pretrained_model_name_or_path,
                 repo_type="model",
                 filename="model.pt",
-                **hf_kwargs
+                **hf_kwargs,
             )
-            checkpoint = torch.load(cached_checkpoint_path, map_location='cpu', weights_only=True)
-        model_config = checkpoint['model_config']
+            checkpoint = torch.load(cached_checkpoint_path, map_location="cpu", weights_only=True)
+        model_config = checkpoint["model_config"]
         if model_kwargs is not None:
             model_config.update(model_kwargs)
         model = cls(**model_config)
-        model.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint["model"])
         return model
 
     @staticmethod
     def cache_pretrained_backbone(encoder: str, pretrained: bool):
-        _ = torch.hub.load('facebookresearch/dinov2', encoder, pretrained=pretrained)
+        _ = torch.hub.load("facebookresearch/dinov2", encoder, pretrained=pretrained)
 
     def load_pretrained_backbone(self):
         "Load the backbone with pretrained dinov2 weights from torch hub"
-        state_dict = torch.hub.load('facebookresearch/dinov2', self.encoder, pretrained=True).state_dict()
+        state_dict = torch.hub.load(
+            "facebookresearch/dinov2", self.encoder, pretrained=True
+        ).state_dict()
         self.backbone.load_state_dict(state_dict)
 
     def load_pretrained_moge(self):
@@ -255,8 +381,8 @@ class HoGeModel(nn.Module):
             repo_type="model",
             filename="model.pt",
         )
-        checkpoint = torch.load(cached_checkpoint_path, map_location='cpu', weights_only=True)
-        moge_state_dict = checkpoint['model']
+        checkpoint = torch.load(cached_checkpoint_path, map_location="cpu", weights_only=True)
+        moge_state_dict = checkpoint["model"]
 
         # sieve size mismatch weights
         model_dict = self.state_dict()
@@ -268,39 +394,90 @@ class HoGeModel(nn.Module):
 
     def enable_backbone_gradient_checkpointing(self):
         for i in range(len(self.backbone.blocks)):
-            self.backbone.blocks[i] = wrap_module_with_gradient_checkpointing(self.backbone.blocks[i])
+            self.backbone.blocks[i] = wrap_module_with_gradient_checkpointing(
+                self.backbone.blocks[i]
+            )
 
     def enable_pytorch_native_sdpa(self):
         for i in range(len(self.backbone.blocks)):
-            self.backbone.blocks[i].attn = wrap_dinov2_attention_with_sdpa(self.backbone.blocks[i].attn)
+            self.backbone.blocks[i].attn = wrap_dinov2_attention_with_sdpa(
+                self.backbone.blocks[i].attn
+            )
 
-    def forward(self, image: torch.Tensor, invalid_mask: Optional[torch.Tensor] = None, mixed_precision: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        image: torch.Tensor,
+        invalid_mask: Optional[torch.Tensor] = None,
+        mixed_precision: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         raw_img_h, raw_img_w = image.shape[-2:]
         patch_h, patch_w = raw_img_h // 14, raw_img_w // 14
 
         image = (image - self.image_mean) / self.image_std
 
         # Apply image transformation for DINOv2
-        image_14 = F.interpolate(image, (patch_h * 14, patch_w * 14), mode="bilinear", align_corners=False, antialias=True)
+        image_14 = F.interpolate(
+            image,
+            (patch_h * 14, patch_w * 14),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
 
         # mask preprocessing (TODO: threshold 0.5 is adequate??????)
         if invalid_mask is not None:
             assert image.shape[-2:] == invalid_mask.shape[-2:]
-            invalid_mask_14 = F.interpolate(invalid_mask.float(), (patch_h * 14, patch_w * 14), mode="bilinear", align_corners=False, antialias=True) > 0.5
+            invalid_mask_14 = (
+                F.interpolate(
+                    invalid_mask.float(),
+                    (patch_h * 14, patch_w * 14),
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                )
+                > 0.5
+            )
             image = torch.where(invalid_mask, 0, image)
             image_14 = torch.where(invalid_mask_14, 0, image_14)
         else:
             invalid_mask_14 = None
 
         # Get intermediate layers from the backbone
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=mixed_precision):
-            features = self.backbone.get_intermediate_layers(image_14, invalid_mask_14, self.intermediate_layers, return_class_token=True)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=mixed_precision):
+            features = self.backbone.get_intermediate_layers(
+                image_14, invalid_mask_14, self.intermediate_layers, return_class_token=True
+            )
 
         # Predict points, mask and so on
-        output = self.head(features, image)  # image is not used indeed, so mask is also unnecessary to feed here
-        points = rearrange(output[0], 'b (num_samples c) h w -> b h w num_samples c', num_samples=self.max_points_per_ray, c=3)
-        colors = rearrange(output[1], 'b (num_samples c) h w -> b h w num_samples c', num_samples=self.max_points_per_ray, c=3) if self.output_color else None
-        confs = rearrange(output[-1], 'b (num_samples c) h w -> b h w num_samples c', num_samples=self.max_points_per_ray, c=1) if self.output_conf else None
+        output = self.head(
+            features, image
+        )  # image is not used indeed, so mask is also unnecessary to feed here
+        points = rearrange(
+            output[0],
+            "b (num_samples c) h w -> b h w num_samples c",
+            num_samples=self.max_points_per_ray,
+            c=3,
+        )
+        colors = (
+            rearrange(
+                output[1],
+                "b (num_samples c) h w -> b h w num_samples c",
+                num_samples=self.max_points_per_ray,
+                c=3,
+            )
+            if self.output_color
+            else None
+        )
+        confs = (
+            rearrange(
+                output[-1],
+                "b (num_samples c) h w -> b h w num_samples c",
+                num_samples=self.max_points_per_ray,
+                c=1,
+            )
+            if self.output_conf
+            else None
+        )
 
         # remap_output is 'exp'
         xy, z = points.split([2, 1], dim=-1)
@@ -308,11 +485,11 @@ class HoGeModel(nn.Module):
         z = torch.cumsum(z, dim=-1)  # guarantee ascending order
         points = torch.cat([xy * z, z], dim=-1)
 
-        return_dict = {'points': points}
+        return_dict = {"points": points}
         if self.output_color:
-            return_dict['colors'] = colors
+            return_dict["colors"] = colors
         if self.output_conf:
-            return_dict['confs'] = confs
+            return_dict["confs"] = confs
         return return_dict
 
     # @torch.inference_mode()

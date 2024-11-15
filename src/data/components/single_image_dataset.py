@@ -4,8 +4,8 @@ import os
 import albumentations as A
 import numpy as np
 import torch
-from PIL import Image
 from jaxtyping import Float
+from PIL import Image
 from torch.utils.data import Dataset
 
 

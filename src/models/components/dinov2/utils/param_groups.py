@@ -3,16 +3,17 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
 import logging
-
+from collections import defaultdict
 
 logger = logging.getLogger("dinov2")
 
 
-def get_vit_lr_decay_rate(name, lr_decay_rate=1.0, num_layers=12, force_is_backbone=False, chunked_blocks=False):
-    """
-    Calculate lr decay rate for different ViT blocks.
+def get_vit_lr_decay_rate(
+    name, lr_decay_rate=1.0, num_layers=12, force_is_backbone=False, chunked_blocks=False
+):
+    """Calculate lr decay rate for different ViT blocks.
+
     Args:
         name (string): parameter name.
         lr_decay_rate (float): base lr decay rate.
@@ -70,9 +71,19 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
         if not param.requires_grad:
             continue
         decay_rate = get_vit_lr_decay_rate(
-            name, lr_decay_rate, num_layers=n_blocks, force_is_backbone=n_blocks > 0, chunked_blocks=chunked_blocks
+            name,
+            lr_decay_rate,
+            num_layers=n_blocks,
+            force_is_backbone=n_blocks > 0,
+            chunked_blocks=chunked_blocks,
         )
-        d = {"params": param, "is_last_layer": False, "lr_multiplier": decay_rate, "wd_multiplier": 1.0, "name": name}
+        d = {
+            "params": param,
+            "is_last_layer": False,
+            "lr_multiplier": decay_rate,
+            "wd_multiplier": 1.0,
+            "name": name,
+        }
 
         if "last_layer" in name:
             d.update({"is_last_layer": True})
@@ -84,12 +95,16 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
             d.update({"lr_multiplier": d["lr_multiplier"] * patch_embed_lr_mult})
 
         all_param_groups.append(d)
-        logger.info(f"""{name}: lr_multiplier: {d["lr_multiplier"]}, wd_multiplier: {d["wd_multiplier"]}""")
+        logger.info(
+            f"""{name}: lr_multiplier: {d["lr_multiplier"]}, wd_multiplier: {d["wd_multiplier"]}"""
+        )
 
     return all_param_groups
 
 
-def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier", "is_last_layer")):
+def fuse_params_groups(
+    all_params_groups, keys=("lr_multiplier", "wd_multiplier", "is_last_layer")
+):
     fused_params_groups = defaultdict(lambda: {"params": []})
     for d in all_params_groups:
         identifier = ""
