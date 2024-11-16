@@ -47,16 +47,21 @@ class ConfigureCamera(torch.nn.Module):
         image_size_list = [(height, width) for _ in range(batch)]
 
         # Define a camera (OpenCV -> PyTorch3D)
-        xy_flipmat_4x4 = torch.tensor(
-            [[[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]],
-            dtype=torch.float,
-            device="cuda",
-        )
+        xy_flipvec = torch.tensor([-1, -1, 1], dtype=pose.dtype, device=pose.device)
+        xy_flipmat_3x3 = torch.diag(xy_flipvec).unsqueeze(0)
+        # xy_flipmat_4x4 = torch.tensor(
+        #     [[[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]],
+        #     dtype=pose.dtype,
+        #     device=pose.device,
+        # )
 
-        c2w = torch.linalg.inv(pose) @ xy_flipmat_4x4
-        w2c = torch.linalg.inv(c2w)
-        R = w2c[:, :3, :3].permute(0, 2, 1)
-        T = w2c[:, :3, 3]
+        # c2w = torch.linalg.inv(pose) @ xy_flipmat_4x4
+        # w2c = torch.linalg.inv(c2w)
+        # R = w2c[:, :3, :3].permute(0, 2, 1)
+        # T = w2c[:, :3, 3]
+
+        R = (xy_flipmat_3x3 @ pose[:, :3, :3]).permute(0, 2, 1)
+        T = xy_flipvec * pose[:, :3, 3]
 
         cameras = PerspectiveCameras(
             focal_length=intrinsics.diagonal(dim1=1, dim2=2)[:, :2],

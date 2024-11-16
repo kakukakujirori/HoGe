@@ -193,7 +193,7 @@ class HoGeModule(LightningModule):
             )
 
         if batch_idx == 0 and self.logger.experiment:
-            self.log_images(input_dict, output_dict, name="train", step=self.current_epoch)
+            self.log_images(input_dict, output_dict, name="train_images", step=self.current_epoch)
 
         # return loss or backpropagation will fail
         return loss_dict["total_loss"]
@@ -222,7 +222,7 @@ class HoGeModule(LightningModule):
             )
 
         if batch_idx == 0 and self.logger.experiment:
-            self.log_images(input_dict, output_dict, name="val", step=self.current_epoch)
+            self.log_images(input_dict, output_dict, name="val_images", step=self.current_epoch)
 
     def on_validation_epoch_end(self) -> None:
         "Lightning hook that is called when a validation epoch ends."
@@ -248,7 +248,7 @@ class HoGeModule(LightningModule):
             )
 
         if batch_idx == 0 and self.logger.experiment:
-            self.log_images(input_dict, output_dict, name="test", step=self.current_epoch)
+            self.log_images(input_dict, output_dict, name="test_images", step=self.current_epoch)
 
     def on_test_epoch_end(self) -> None:
         """Lightning hook that is called when a test epoch ends."""

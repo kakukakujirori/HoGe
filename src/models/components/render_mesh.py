@@ -158,6 +158,11 @@ class RenderMesh(torch.nn.Module):
     def section_arange(x: torch.Tensor) -> torch.Tensor:
         "This function behaves like this: x=[0,0,0,1,1,2,4,4,4,5] -> y=[0,1,2,0,1,0,0,1,2,0]"
         assert len(x.shape) == 1 and torch.all(x[:-1] <= x[1:])
+
+        # corner case
+        if x.numel() == 0:
+            return torch.arange(0, dtype=x.dtype, device=x.device)
+
         change_idx = torch.unique(x)
         change_val = torch.cat(
             [
