@@ -13,6 +13,7 @@ from src.models.components.configure_camera import ConfigureCamera
 from src.models.components.hoge_model import HoGeModel
 from src.models.components.moge_mesh import MoGeMesh
 from src.models.components.render_mesh import RenderMesh
+from src.models.losses.optimal_alignment_loss import OptimalAlignmentLoss
 
 
 class HoGeModule(LightningModule):
@@ -52,7 +53,8 @@ class HoGeModule(LightningModule):
         criterion_list: list[torch.nn.Module],
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
-        compile: bool,
+        gather_layers_before_inference: bool,
+        compile: bool = True,
     ) -> None:
         """Initialize a `HoGeModule`.
 
@@ -137,22 +139,36 @@ class HoGeModule(LightningModule):
         return texels_rendered, points_rendered, points_original
 
     def model_step(self, image_original: Float[torch.Tensor, "b h w c"]):
+        batch, height, width, channel = image_original.shape
+        layer_num = self.net.max_points_per_ray
+        assert channel == 3
+
         # generate pseudo GT and inputs
         texels_rendered, points_rendered, points_original = self.generate_pseudo_gt(image_original)
-        image_rendered = texels_rendered[:, :, :, 0, :3]
-        invalid_mask_rendered = (
-            texels_rendered[:, :, :, 0, 3] < 0.9
-        )  # NOTE: sky region should be 'invalid'
+
+        if self.hparams.gather_layers_before_inference:
+            points_rendered, texels_rendered = OptimalAlignmentLoss.gather_valid_points(
+                points_rendered,
+                texels_rendered,
+                mask_thresh=0.5,  # NOTE: sky region is 'valid' here
+            )
 
         input_dict = {
-            "image_original": image_original,  # (b, h, w, 3)
-            "points_original": points_original,  # (b, h, w, 3)
-            "texels_rendered": texels_rendered,  # (b, h, w, layers, 4)
-            "points_rendered": points_rendered,  # (b, h, w, layers, 3)
-            "masks_rendered": ~invalid_mask_rendered,  # (b, h, w)
+            "image_original": image_original,
+            "points_original": points_original,
+            "texels_rendered": texels_rendered,
+            "points_rendered": points_rendered,
         }
+        assert input_dict["image_original"].shape == (batch, height, width, 3)
+        assert input_dict["points_original"].shape == (batch, height, width, 3)
+        assert input_dict["texels_rendered"].shape == (batch, height, width, layer_num, 4)
+        assert input_dict["points_rendered"].shape == (batch, height, width, layer_num, 3)
 
         # HoGe inference
+        image_rendered = input_dict["texels_rendered"][:, :, :, 0, :3]
+        invalid_mask_rendered = (
+            input_dict["texels_rendered"][:, :, :, 0, 3] < 0.5
+        )  # NOTE: sky region is 'valid' here
         output_dict = self.forward(
             image=rearrange(image_rendered, "b h w c -> b c h w"),
             invalid_mask=rearrange(invalid_mask_rendered, "b h w -> b () h w"),
@@ -294,6 +310,15 @@ class HoGeModule(LightningModule):
         depth_pred = (depth_pred - depth_pred.min()) / (depth_pred.max() - depth_pred.min())
         depth_pred = torch.clip(255 * depth_pred, 0, 255).to(torch.uint8).cpu().numpy()
 
+        # rearrange colors
+        color_pred = rearrange(output_colors, "h w samples c -> samples h w c", c=3)
+        color_pred = torch.clip(255 * color_pred, 0, 255).to(torch.uint8).cpu().numpy()
+
+        # normalize confs
+        conf_pred = rearrange(output_confs[..., 0], "h w samples -> samples h w")
+        conf_pred = torch.sigmoid(conf_pred)
+        conf_pred = torch.clip(255 * conf_pred, 0, 255).to(torch.uint8).cpu().numpy()
+
         if isinstance(self.logger, WandbLogger):
             self.logger.log_image(
                 key=os.path.join(name, "image"),
@@ -309,6 +334,16 @@ class HoGeModule(LightningModule):
                 key=os.path.join(name, "depth_pred"),
                 step=step,
                 images=[dep for dep in depth_pred],
+            )
+            self.logger.log_image(
+                key=os.path.join(name, "color_pred"),
+                step=step,
+                images=[color for color in color_pred],
+            )
+            self.logger.log_image(
+                key=os.path.join(name, "conf_pred"),
+                step=step,
+                images=[conf for conf in conf_pred],
             )
 
         else:
@@ -336,7 +371,14 @@ class HoGeModule(LightningModule):
 
         :return: A dict containing the configured optimizers and learning-rate schedulers to be used for training.
         """
-        optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
+        backbone_lr = self.hparams.optimizer.keywords.pop("backbone_lr")
+        head_lr = self.hparams.optimizer.keywords.pop("head_lr")
+        optimizer = self.hparams.optimizer(
+            params=[
+                {"params": self.net.backbone.parameters(), "lr": backbone_lr},
+                {"params": self.net.head.parameters(), "lr": head_lr},
+            ]
+        )
         if self.hparams.scheduler is not None:
             scheduler = self.hparams.scheduler(optimizer=optimizer)
             return {

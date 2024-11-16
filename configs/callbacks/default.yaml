@@ -1,4 +1,5 @@
 defaults:
+  - lr_monitor
   - model_checkpoint
   # - early_stopping
   - model_summary

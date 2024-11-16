@@ -15,6 +15,7 @@ class OptimalAlignmentLoss(torch.nn.Module):
         dist_weight: float = 1.0,
         color_weight: float = 1.0,
         conf_weight: float = 1.0,
+        coerce_positive_scale_alignment: bool = False,
     ) -> None:
         super().__init__()
         self.visible_weight = visible_weight
@@ -22,8 +23,7 @@ class OptimalAlignmentLoss(torch.nn.Module):
         self.dist_weight = dist_weight
         self.color_weight = color_weight
         self.conf_weight = conf_weight
-
-        self.optimal_alignment_solver_unimplemented_warning_flag = True
+        self.coerce_positive_scale_alignment = coerce_positive_scale_alignment
 
     def forward(
         self,
@@ -32,25 +32,28 @@ class OptimalAlignmentLoss(torch.nn.Module):
     ) -> torch.Tensor:
         # gather valid points pixelwisely (maybe redundant, but to make things clear)
         input_points_gathered, input_texels_gathered = self.gather_valid_points(
-            input_dict
-        )  # (b, h, w, layers, 3)
-        input_masks = input_dict.get("masks_rendered", None)  # (b, h, w)
+            input_dict["points_rendered"],
+            input_dict["texels_rendered"],
+            mask_thresh=0.9,  # NOTE: sky region is invalid here
+        )
+        input_masks = (
+            input_dict["texels_rendered"][:, :, :, 0, 3] > 0.9
+        )  # NOTE: sky region is invalid here
         output_points = output_dict["points"]  # (b, h, w, layers, 3)
 
         batch, height, width, layers, channel = input_points_gathered.shape
         assert channel == 3
-        assert (
-            input_points_gathered.shape == output_points.shape
-        ), f"{input_points_gathered.shape=}, {output_points.shape=}"
-        assert (
-            input_masks is None or (batch, height, width) == input_masks.shape
-        ), f"{input_masks.shape=}"
+        assert input_points_gathered.shape == output_points.shape
+        assert (batch, height, width) == input_masks.shape
 
         # optimal scale and shift are determined from the first layer results
         input_points_first = input_points_gathered[:, :, :, 0, :]
         target_points_first = output_points[:, :, :, 0, :]
         scale, shift = self.optimal_alignment_solver(
-            input_points_first, target_points_first, input_masks
+            input_points_first,
+            target_points_first,
+            input_masks,
+            coerce_positive_scale=self.coerce_positive_scale_alignment,
         )
         output_points_aligned = scale.reshape(batch, 1, 1, 1, 1) * output_points + shift.reshape(
             batch, 1, 1, 1, 3
@@ -93,10 +96,12 @@ class OptimalAlignmentLoss(torch.nn.Module):
         return loss_dict
 
     @staticmethod
-    def gather_valid_points(input_dict: dict[str, torch.Tensor]):
-        points: Float[torch.Tensor, "b h w layers 3"] = input_dict["points_rendered"]
-        texels: Float[torch.Tensor, "b h w layers 4"] = input_dict["texels_rendered"]
-        valid_masks = texels[:, :, :, :, 3:4] > 0.9  # NOTE: sky region is invalid here
+    def gather_valid_points(
+        points: Float[torch.Tensor, "b h w layers 3"],
+        texels: Float[torch.Tensor, "b h w layers 4"],
+        mask_thresh: float,
+    ):
+        valid_masks = texels[:, :, :, :, 3:4] > mask_thresh
         points_filled = torch.where(valid_masks, points, torch.inf)
         points_filled_z = points_filled[..., 2:3]
         points_filled_z_sorted, sort_idx = torch.sort(points_filled_z, dim=-2)
