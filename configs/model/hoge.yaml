@@ -42,6 +42,7 @@ criterion_list:
     coerce_positive_scale_alignment: false
 
 gather_layers_before_inference: true
+log_images_every_n_steps: 1000
 
 # compile model for faster training with pytorch 2.0
 compile: true

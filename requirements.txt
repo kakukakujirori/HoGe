@@ -25,7 +25,8 @@ pytest          # tests
 # sh            # for running bash commands in some tests (linux/macos only)
 albumentations
 einops
+huggingface_hub
 jaxtyping
 kornia
-utils3d
 git+https://github.com/facebookresearch/pytorch3d.git
+git+https://github.com/EasternJournalist/utils3d.git#egg=utils3d

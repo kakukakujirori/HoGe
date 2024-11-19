@@ -54,6 +54,7 @@ class HoGeModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         gather_layers_before_inference: bool,
+        log_images_every_n_steps: int = -1,
         compile: bool = True,
     ) -> None:
         """Initialize a `HoGeModule`.
@@ -84,6 +85,14 @@ class HoGeModule(LightningModule):
 
         # loss functions
         self.criterion_list = torch.nn.ModuleList(criterion_list)
+
+        # logging
+        if log_images_every_n_steps > 0:
+            self.log_images_every_n_steps = log_images_every_n_steps
+        else:
+            self.log_images_every_n_steps = (
+                self.trainer.estimated_stepping_batches
+            )  # huge number so only batch_idx=0 is recorded
 
     def forward(
         self, image: Float[torch.Tensor, "b c h w"], invalid_mask: Float[torch.Tensor, "b c h w"]
@@ -208,8 +217,8 @@ class HoGeModule(LightningModule):
                 sync_dist=True,
             )
 
-        if batch_idx == 0 and self.logger.experiment:
-            self.log_images(input_dict, output_dict, name="train_images", step=self.current_epoch)
+        if batch_idx % self.log_images_every_n_steps == 0 and self.logger.experiment:
+            self.log_images(input_dict, output_dict, name="train_images", step=self.global_step)
 
         # return loss or backpropagation will fail
         return loss_dict["total_loss"]
