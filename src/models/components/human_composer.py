@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from einops import rearrange
+from geocalib import GeoCalib
 from groundingdino.util.inference import Model as GroundingDINOModule
 from groundingdino.util.utils import get_phrases_from_posmap
 from jaxtyping import Float
@@ -20,19 +21,26 @@ from ultralytics import YOLO
 from third_party.MaGGIe.maggie.network.arch import MaGGIe
 from third_party.StyleGAN_Human import dnnlib, legacy
 
+STYLEGAN_HUMAN_PKL = (
+    "/home/ryotaro/github/StyleGAN-Human/pretrained_models/stylegan_human_v2_1024.pkl"
+)
+GROUNDING_DINO_CFG = "/home/ryotaro/github/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+GROUNDING_DINO_CKPT = "/home/ryotaro/github/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
+DEPTHPRO_CKPT = "/home/ryotaro/github/ml-depth-pro/checkpoints/depth_pro.pt"
+
 
 class HumanComposer(nn.Module):
     def __init__(
         self,
-        stylegan_human_pkl: str,  # "/home/ryotaro/github/StyleGAN-Human/pretrained_models/stylegan_human_v2_1024.pkl"
-        grounding_dino_cfg: str,  # "/home/ryotaro/github/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-        groundiong_dino_ckpt: str,  # "/home/ryotaro/github/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
-        depthpro_ckpt: str,  # "/home/ryotaro/github/ml-depth-pro/checkpoints/depth_pro.pt"
+        use_depthpro: bool = False,
+        verbose: bool = False,
     ):
         super().__init__()
+        self.use_depthpro = use_depthpro
+        self.verbose = verbose
 
         # StyleGAN-Human
-        with dnnlib.util.open_url(stylegan_human_pkl) as f:
+        with dnnlib.util.open_url(STYLEGAN_HUMAN_PKL) as f:
             self.stylegan_human = legacy.load_network_pkl(f)["G_ema"]
 
         # YOLO11 Human Segmentation
@@ -44,16 +52,23 @@ class HumanComposer(nn.Module):
 
         # GroundedSAM
         self.grounding_dino_model = GroundingDINOModule(
-            model_config_path=grounding_dino_cfg,
-            model_checkpoint_path=groundiong_dino_ckpt,
+            model_config_path=GROUNDING_DINO_CFG,
+            model_checkpoint_path=GROUNDING_DINO_CKPT,
             device="cpu",
         ).model
         self.sam_predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
 
         # DepthPro
-        cfg = depth_pro.depth_pro.DEFAULT_MONODEPTH_CONFIG_DICT
-        cfg.checkpoint_uri = depthpro_ckpt
-        self.depth_pro_model, _ = depth_pro.create_model_and_transforms()
+        if use_depthpro:
+            cfg = depth_pro.depth_pro.DEFAULT_MONODEPTH_CONFIG_DICT
+            cfg.checkpoint_uri = DEPTHPRO_CKPT
+            self.depth_pro_model, _ = depth_pro.create_model_and_transforms()
+        else:
+            # GeoCalib & Metric3Dv2
+            self.geocalib = GeoCalib()
+            self.metric3dv2 = torch.hub.load(
+                "yvanyin/metric3d", "metric3d_vit_small", pretrain=True
+            )
 
         # compile
         # self.compile()
@@ -64,7 +79,8 @@ class HumanComposer(nn.Module):
         self.matting_model = torch.compile(self.matting_model)
         self.grounding_dino_model = torch.compile(self.grounding_dino_model)
         self.sam_predictor.model = torch.compile(self.sam_predictor.model)
-        self.depth_pro_model = torch.compile(self.depth_pro_model)
+        # self.depth_pro_model = torch.compile(self.depth_pro_model)
+        self.metric3dv2 = torch.compile(self.metric3dv2)
 
     def generate_human(
         self, batch: int, truncation_psi: float = 1.0, noise_mode: str = "const", device="cuda"
@@ -206,6 +222,9 @@ class HumanComposer(nn.Module):
             confs = confs[masks]  # (n)
             boxes = boxes[masks]  # (n, 4)
 
+            if self.verbose:
+                print(f"[HumanComposer] segment_ground: DINO_{confs=}")
+
             # NMS post process
             # print(f"Before NMS: {len(boxes)} boxes")
             nms_idx = torchvision.ops.nms(boxes, confs, NMS_THRESHOLD)
@@ -264,6 +283,9 @@ class HumanComposer(nn.Module):
                     return_logits=False,
                     img_idx=img_idx,
                 )
+                if self.verbose:
+                    print(f"[HumanComposer] segment_ground: SAM2_{iou_predictions=}")
+
                 index = torch.argmax(iou_predictions, dim=1)
                 masks_highest_score = masks[torch.arange(len(index)), index]
                 result_masks.append(
@@ -273,6 +295,83 @@ class HumanComposer(nn.Module):
         ground_mask = torch.stack(result_masks, dim=0).float().unsqueeze(1)
         ground_mask = F.interpolate(ground_mask, (height, width), mode="bilinear")
         return ground_mask  # , sam_bbox_input
+
+    def get_metric_depth(self, img: Float[torch.Tensor, "b 3 h w"]):
+        batch, channel, height, width = img.shape
+        assert channel == 3
+
+        # calibration
+        cam_focal_len = []
+        for b in range(batch):
+            calib_result = self.geocalib.calibrate(img[b])
+            cam_focal_len.append(calib_result["camera"].f.mean())
+        cam_focal_len = torch.stack(cam_focal_len)
+
+        # metric3d
+        input_size = (616, 1064)  # for vit model
+        # input_size = (544, 1216) # for convnext model
+        scale = min(input_size[0] / height, input_size[1] / width)
+        img_resized = F.interpolate(img, scale_factor=scale, mode="bilinear")
+        # padding to input_size
+        img_padded = torch.empty((batch, channel, *input_size), dtype=img.dtype, device=img.device)
+        img_padded[:, 0, :, :] = 123.675 / 255
+        img_padded[:, 1, :, :] = 116.28 / 255
+        img_padded[:, 2, :, :] = 103.53 / 255
+        _, _, h, w = img_resized.shape
+        pad_h = input_size[0] - h
+        pad_w = input_size[1] - w
+        pad_h_half = pad_h // 2
+        pad_w_half = pad_w // 2
+        assert pad_h == 0 or pad_w == 0
+        if pad_h == 0 and pad_w > 0:
+            img_padded[:, :, :, pad_w_half : -(pad_w - pad_w_half)] = img_resized
+        elif pad_h > 0 and pad_w == 0:
+            img_padded[:, :, pad_h_half : -(pad_h - pad_h_half), :] = img_resized
+        elif pad_h == pad_w == 0:
+            img_padded = img_resized
+        pad_info = [pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half]
+
+        # normalize
+        mean = (
+            torch.tensor([123.675, 116.28, 103.53], dtype=img.dtype, device=img.device).reshape(
+                1, 3, 1, 1
+            )
+            / 255
+        )
+        std = (
+            torch.tensor([58.395, 57.12, 57.375], dtype=img.dtype, device=img.device).reshape(
+                1, 3, 1, 1
+            )
+            / 255
+        )
+        img_padded = torch.div((img_padded - mean), std)
+
+        # >>>>>>>>>>>>>>>>>>>> canonical camera space >>>>>>>>>>>>>>>>>>>>
+        # inference
+        pred_depth, confidence, output_dict = self.metric3dv2.inference({"input": img_padded})
+
+        # un pad
+        pred_depth = pred_depth[
+            :,
+            :,
+            pad_info[0] : input_size[0] - pad_info[1],
+            pad_info[2] : input_size[1] - pad_info[3],
+        ]
+
+        # upsample to original size
+        pred_depth = F.interpolate(pred_depth, (height, width), mode="bilinear")
+        # >>>>>>>>>>>>>>>>>>>> canonical camera space >>>>>>>>>>>>>>>>>>>>
+
+        # de-canonical transform
+        canonical_to_real_scale = (
+            cam_focal_len * scale / 1000.0
+        )  # 1000.0 is the focal length of canonical camera
+        pred_depth = pred_depth * canonical_to_real_scale.reshape(
+            batch, 1, 1, 1
+        )  # now the depth is metric
+        pred_depth = torch.clamp(pred_depth, 0, 300)
+
+        return pred_depth.squeeze(1), cam_focal_len  # align with the DepthPro output
 
     def configure(
         self,
@@ -290,9 +389,14 @@ class HumanComposer(nn.Module):
         assert ground_mask.shape == (batch, 1, h, w)
 
         # metric depth & focal_len
-        prediction = self.depth_pro_model.infer(2 * bkg - 1, f_px=None)
-        metric_depth = prediction["depth"].reshape(batch, h, w)  # Depth in [m].
-        cam_focal_len = prediction["focallength_px"]
+        if self.use_depthpro:
+            prediction = self.depth_pro_model.infer(2 * bkg - 1, f_px=None)
+            metric_depth = prediction["depth"].reshape(batch, h, w)  # Depth in [m].
+            cam_focal_len = prediction["focallength_px"]
+        else:
+            metric_depth, cam_focal_len = self.get_metric_depth(bkg)
+        if self.verbose:
+            print(f"[HumanComposer] configure: {cam_focal_len=}")
 
         # select human position and size
         true_indices = ground_mask.nonzero(as_tuple=False)  # (N, 4)
@@ -385,7 +489,7 @@ class HumanComposer(nn.Module):
             ret[b] = torch.where(bg_forefront_mask, bkg[b], ret[b])
             ret_mask[b][bg_forefront_mask] = 0
 
-        return ret, ret_mask
+        return ret, ret_mask, metric_depth
 
     def forward(
         self, img: Float[torch.Tensor, "b c h w"]
@@ -393,5 +497,5 @@ class HumanComposer(nn.Module):
         human = self.generate_human(batch=img.shape[0], device=img.device)
         segmask = self.segment_human(human)
         ground_mask = self.segment_ground(img)
-        ret, ret_mask = self.configure(human, segmask, img, ground_mask)
-        return ret, ret_mask
+        ret, ret_mask, metric_depth = self.configure(human, segmask, img, ground_mask)
+        return ret, ret_mask, ground_mask, metric_depth
