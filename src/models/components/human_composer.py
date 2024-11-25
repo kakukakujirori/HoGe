@@ -19,6 +19,7 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from ultralytics import YOLO
 
 from third_party.MaGGIe.maggie.network.arch import MaGGIe
+from third_party.PCTNet.iharm.inference.utils import load_model
 from third_party.StyleGAN_Human import dnnlib, legacy
 
 STYLEGAN_HUMAN_PKL = (
@@ -27,6 +28,14 @@ STYLEGAN_HUMAN_PKL = (
 GROUNDING_DINO_CFG = "/home/ryotaro/github/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_CKPT = "/home/ryotaro/github/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
 DEPTHPRO_CKPT = "/home/ryotaro/github/ml-depth-pro/checkpoints/depth_pro.pt"
+HARMONIZER_WEIGHT = (
+    "/home/ryotaro/my_works/HoGe/third_party/PCTNet/pretrained_models/PCTNet_ViT.pth"
+)
+
+
+class HumanCompositionError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
 
 
 class HumanComposer(nn.Module):
@@ -58,8 +67,8 @@ class HumanComposer(nn.Module):
         ).model
         self.sam_predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
 
-        # DepthPro
         if use_depthpro:
+            # DepthPro
             cfg = depth_pro.depth_pro.DEFAULT_MONODEPTH_CONFIG_DICT
             cfg.checkpoint_uri = DEPTHPRO_CKPT
             self.depth_pro_model, _ = depth_pro.create_model_and_transforms()
@@ -69,6 +78,10 @@ class HumanComposer(nn.Module):
             self.metric3dv2 = torch.hub.load(
                 "yvanyin/metric3d", "metric3d_vit_small", pretrain=True
             )
+
+        # Harmonizer
+        model_type = "ViT_pct"
+        self.harmonizer = load_model(model_type, HARMONIZER_WEIGHT, verbose=False)
 
         # compile
         # self.compile()
@@ -216,11 +229,16 @@ class HumanComposer(nn.Module):
 
         # NMS for each image
         sam_bbox_input = []
-        for confs, boxes in zip(prediction_confs, prediction_boxes):
+        for confs_init, boxes_init in zip(prediction_confs, prediction_boxes):
             # extract valid bboxes
-            masks = confs > BOX_THRESHOLD
-            confs = confs[masks]  # (n)
-            boxes = boxes[masks]  # (n, 4)
+            masks = confs_init > BOX_THRESHOLD
+            confs = confs_init[masks]  # (n)
+            boxes = boxes_init[masks]  # (n, 4)
+
+            if not torch.any(masks):
+                raise HumanCompositionError(
+                    f"Ground not detected (DINO_confs.max()={confs_init.max().cpu()})"
+                )
 
             if self.verbose:
                 print(f"[HumanComposer] segment_ground: DINO_{confs=}")
@@ -291,6 +309,11 @@ class HumanComposer(nn.Module):
                 result_masks.append(
                     torch.max(masks_highest_score, dim=0)[0]
                 )  # union of different object masks
+
+                if torch.mean(result_masks[-1].float()) > 0.95:
+                    raise HumanCompositionError(
+                        f"Too large ground mask (masks.mean()={torch.mean(result_masks[-1].float()).cpu()})"
+                    )
 
         ground_mask = torch.stack(result_masks, dim=0).float().unsqueeze(1)
         ground_mask = F.interpolate(ground_mask, (height, width), mode="bilinear")
@@ -491,6 +514,17 @@ class HumanComposer(nn.Module):
 
         return ret, ret_mask, metric_depth
 
+    def harmonize(
+        self, composed: Float[torch.Tensor, "b 3 h w"], mask: Float[torch.Tensor, "b 1 h w"]
+    ):
+        composed_lr = F.interpolate(composed, (256, 256), mode="bilinear")
+        mask_lr = F.interpolate(mask, (256, 256), mode="bilinear")
+        output = self.harmonizer(composed_lr, composed, mask_lr, mask)
+        output_fullres = output["images_fullres"]
+        if len(output_fullres.shape) == 3:
+            output_fullres = output_fullres.unsqueeze(0)  # in case b = 1
+        return output_fullres
+
     def forward(
         self, img: Float[torch.Tensor, "b c h w"]
     ) -> tuple[Float[torch.Tensor, "b c h w"], Float[torch.Tensor, "b c h w"]]:
@@ -498,4 +532,5 @@ class HumanComposer(nn.Module):
         segmask = self.segment_human(human)
         ground_mask = self.segment_ground(img)
         ret, ret_mask, metric_depth = self.configure(human, segmask, img, ground_mask)
+        ret = self.harmonize(ret, ret_mask)
         return ret, ret_mask, ground_mask, metric_depth
