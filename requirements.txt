@@ -28,5 +28,6 @@ einops
 huggingface_hub
 jaxtyping
 kornia
+natten
 git+https://github.com/facebookresearch/pytorch3d.git
 git+https://github.com/EasternJournalist/utils3d.git#egg=utils3d

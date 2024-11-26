@@ -1,21 +1,11 @@
-import sys
-
-import cv2
-import depth_pro
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-from einops import rearrange
 from geocalib import GeoCalib
-from groundingdino.util.inference import Model as GroundingDINOModule
-from groundingdino.util.utils import get_phrases_from_posmap
 from jaxtyping import Float
-from PIL import Image
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
 from ultralytics import YOLO
 
 from third_party.MaGGIe.maggie.network.arch import MaGGIe
@@ -25,9 +15,6 @@ from third_party.StyleGAN_Human import dnnlib, legacy
 STYLEGAN_HUMAN_PKL = (
     "/home/ryotaro/github/StyleGAN-Human/pretrained_models/stylegan_human_v2_1024.pkl"
 )
-GROUNDING_DINO_CFG = "/home/ryotaro/github/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-GROUNDING_DINO_CKPT = "/home/ryotaro/github/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
-DEPTHPRO_CKPT = "/home/ryotaro/github/ml-depth-pro/checkpoints/depth_pro.pt"
 HARMONIZER_WEIGHT = (
     "/home/ryotaro/my_works/HoGe/third_party/PCTNet/pretrained_models/PCTNet_ViT.pth"
 )
@@ -41,11 +28,9 @@ class HumanCompositionError(Exception):
 class HumanComposer(nn.Module):
     def __init__(
         self,
-        use_depthpro: bool = False,
         verbose: bool = False,
     ):
         super().__init__()
-        self.use_depthpro = use_depthpro
         self.verbose = verbose
 
         # StyleGAN-Human
@@ -59,25 +44,20 @@ class HumanComposer(nn.Module):
         # MaGGIe Human Matting
         self.matting_model = MaGGIe.from_pretrained("chuonghm/maggie-image-him50k-cvpr24").cpu()
 
-        # GroundedSAM
-        self.grounding_dino_model = GroundingDINOModule(
-            model_config_path=GROUNDING_DINO_CFG,
-            model_checkpoint_path=GROUNDING_DINO_CKPT,
-            device="cpu",
-        ).model
-        self.sam_predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
+        # OneFormer
+        self.oneformer_processor = OneFormerProcessor.from_pretrained(
+            "shi-labs/oneformer_ade20k_dinat_large"
+        )
+        self.oneformer_task_inputs = self.oneformer_processor._preprocess_text(
+            ["the task is semantic"]
+        )
+        self.oneformer = OneFormerForUniversalSegmentation.from_pretrained(
+            "shi-labs/oneformer_ade20k_dinat_large"
+        )
 
-        if use_depthpro:
-            # DepthPro
-            cfg = depth_pro.depth_pro.DEFAULT_MONODEPTH_CONFIG_DICT
-            cfg.checkpoint_uri = DEPTHPRO_CKPT
-            self.depth_pro_model, _ = depth_pro.create_model_and_transforms()
-        else:
-            # GeoCalib & Metric3Dv2
-            self.geocalib = GeoCalib()
-            self.metric3dv2 = torch.hub.load(
-                "yvanyin/metric3d", "metric3d_vit_small", pretrain=True
-            )
+        # GeoCalib & Metric3Dv2
+        self.geocalib = GeoCalib()
+        self.metric3dv2 = torch.hub.load("yvanyin/metric3d", "metric3d_vit_small", pretrain=True)
 
         # Harmonizer
         model_type = "ViT_pct"
@@ -179,145 +159,57 @@ class HumanComposer(nn.Module):
     def segment_ground(
         self, img: Float[torch.Tensor, "b 3 h w"]
     ) -> Float[torch.Tensor, "b 1 h w"]:
-        # ground detection
-        CLASSES = [
-            "Ground",
-            "Floor",
-            "Carpet",
-        ]
-        BOX_THRESHOLD = 0.25
-        TEXT_THRESHOLD = 0.25
-        NMS_THRESHOLD = 0.8
+        b, c, h_ori, w_ori = img.shape
+        assert c == 3
 
-        # size so the shorter edge size is 800 but the longer edge size doesn't exceed 1333
-        batch, channel, height, width = img.shape
-        assert channel == 3
+        mean = torch.tensor(
+            self.oneformer_processor.image_processor.image_mean,
+            dtype=img.dtype,
+            device=img.device,
+        ).reshape(1, 3, 1, 1)
 
-        mean = torch.tensor([0.485, 0.456, 0.406], dtype=img.dtype, device=img.device).reshape(
-            1, 3, 1, 1
+        std = torch.tensor(
+            self.oneformer_processor.image_processor.image_std,
+            dtype=img.dtype,
+            device=img.device,
+        ).reshape(1, 3, 1, 1)
+
+        scale_factor = self.oneformer_processor.image_processor.size["shortest_edge"] / min(
+            img.shape[-2:]
         )
-        std = torch.tensor([0.229, 0.224, 0.225], dtype=img.dtype, device=img.device).reshape(
-            1, 3, 1, 1
+        pixel_values = F.interpolate(img, scale_factor=scale_factor, mode="bilinear")
+        pixel_values *= 255 * self.oneformer_processor.image_processor.rescale_factor
+        pixel_values = (pixel_values - mean) / std
+
+        b, c, h, w = pixel_values.shape
+        semantic_inputs = {
+            "pixel_values": pixel_values,
+            "pixel_mask": torch.ones(b, h, w, dtype=torch.int64, device=img.device),
+            "task_inputs": self.oneformer_task_inputs.repeat(b, 1).to(img.device),
+        }
+        semantic_outputs = self.oneformer(**semantic_inputs)
+        predicted_semantic_map = self.oneformer_processor.post_process_semantic_segmentation(
+            semantic_outputs,
+            target_sizes=[(h_ori, w_ori)] * b,
         )
-        img_norm = (img - mean) / std
+        predicted_semantic_map = torch.stack(predicted_semantic_map, dim=0).unsqueeze(
+            1
+        )  # (b, 1, h_ori, w_ori)
 
-        if width < height:
-            ow = min(800, 1333 * width // height)
-            oh = height * ow // width
-        else:
-            oh = min(800, 1333 * height // width)
-            ow = width * oh // height
-        img_preprocessed = F.interpolate(img_norm, (oh, ow), mode="bilinear")
-
-        caption = ". ".join(CLASSES) + "."
-        with torch.no_grad():
-            outputs = self.grounding_dino_model(
-                img_preprocessed, captions=[caption for _ in range(batch)]
-            )
-
-        # nq => num of object queries, 256 => object class description (in case the caption contain different class names)
-        prediction_confs = (
-            outputs["pred_logits"].sigmoid().max(dim=-1)[0]
-        )  # prediction_logits.shape = (b, nq, 256) -> (b, nq)
-        prediction_boxes = outputs["pred_boxes"]  # prediction_boxes.shape = (b, nq, 4)
-        prediction_boxes *= torch.tensor(
-            [[[width, height, width, height]]], dtype=img.dtype, device=img.device
-        )  # normalized -> absolute
-        prediction_boxes = torchvision.ops.box_convert(
-            prediction_boxes.reshape(-1, 4), in_fmt="cxcywh", out_fmt="xyxy"
-        ).reshape(batch, -1, 4)
-
-        # NMS for each image
-        sam_bbox_input = []
-        for confs_init, boxes_init in zip(prediction_confs, prediction_boxes):
-            # extract valid bboxes
-            masks = confs_init > BOX_THRESHOLD
-            confs = confs_init[masks]  # (n)
-            boxes = boxes_init[masks]  # (n, 4)
-
-            if not torch.any(masks):
-                raise HumanCompositionError(
-                    f"Ground not detected (DINO_confs.max()={confs_init.max().cpu()})"
-                )
-
-            if self.verbose:
-                print(f"[HumanComposer] segment_ground: DINO_{confs=}")
-
-            # NMS post process
-            # print(f"Before NMS: {len(boxes)} boxes")
-            nms_idx = torchvision.ops.nms(boxes, confs, NMS_THRESHOLD)
-            boxes = boxes[nms_idx]
-            # print(f"After NMS: {len(boxes)} boxes")
-
-            # SAM input format
-            sam_bbox_input.append(boxes)
-
-        # SAM segmentation
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            # 1. set_image_batch
-            self.sam_predictor.reset_predictor()
-            self.sam_predictor._orig_hw = [(height, width) for _ in range(batch)]
-            img_batch = F.interpolate(
-                img_preprocessed,
-                (self.sam_predictor.model.image_size, self.sam_predictor.model.image_size),
-                mode="bilinear",
-            )
-
-            backbone_out = self.sam_predictor.model.forward_image(img_batch)
-            _, vision_feats, _, _ = self.sam_predictor.model._prepare_backbone_features(
-                backbone_out
-            )
-            # Add no_mem_embed, which is added to the lowest rest feat. map during training on videos
-            if self.sam_predictor.model.directly_add_no_mem_embed:
-                vision_feats[-1] = vision_feats[-1] + self.sam_predictor.model.no_mem_embed
-
-            feats = [
-                feat.permute(1, 2, 0).view(batch, -1, *feat_size)
-                for feat, feat_size in zip(
-                    vision_feats[::-1], self.sam_predictor._bb_feat_sizes[::-1]
-                )
-            ][::-1]
-            self.sam_predictor._features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
-            self.sam_predictor._is_image_set = True
-            self.sam_predictor._is_batch = True
-
-            # 2. predict
-            result_masks = []
-            for img_idx in range(batch):
-                mask_input, unnorm_coords, labels, unnorm_box = self.sam_predictor._prep_prompts(
-                    None,  # point_coords,
-                    None,  # point_labels,
-                    sam_bbox_input[img_idx],
-                    None,  # mask_input,
-                    normalize_coords=True,
-                    img_idx=img_idx,
-                )
-                masks, iou_predictions, low_res_masks = self.sam_predictor._predict(
-                    unnorm_coords,
-                    labels,
-                    unnorm_box,
-                    mask_input,
-                    multimask_output=True,
-                    return_logits=False,
-                    img_idx=img_idx,
-                )
-                if self.verbose:
-                    print(f"[HumanComposer] segment_ground: SAM2_{iou_predictions=}")
-
-                index = torch.argmax(iou_predictions, dim=1)
-                masks_highest_score = masks[torch.arange(len(index)), index]
-                result_masks.append(
-                    torch.max(masks_highest_score, dim=0)[0]
-                )  # union of different object masks
-
-                if torch.mean(result_masks[-1].float()) > 0.95:
-                    raise HumanCompositionError(
-                        f"Too large ground mask (masks.mean()={torch.mean(result_masks[-1].float()).cpu()})"
-                    )
-
-        ground_mask = torch.stack(result_masks, dim=0).float().unsqueeze(1)
-        ground_mask = F.interpolate(ground_mask, (height, width), mode="bilinear")
-        return ground_mask  # , sam_bbox_input
+        # In ADE20K
+        ground_mask = (
+            (predicted_semantic_map == 3)  # 3 => floor
+            + (predicted_semantic_map == 6)  # 6 => road, route
+            + (predicted_semantic_map == 9)  # 9 => grass
+            + (predicted_semantic_map == 11)  # 11 => sidewalk, pavement
+            + (predicted_semantic_map == 13)  # 13 => earth, ground
+            + (predicted_semantic_map == 28)  # 28 => rug
+            + (predicted_semantic_map == 53)  # 53 => stairs
+            + (predicted_semantic_map == 59)  # 59 => stairway, staircase
+            + (predicted_semantic_map == 96)  # 96 => escalator, moving staircase, moving stairway
+            + (predicted_semantic_map == 121)  # 121 => step, stair
+        )
+        return ground_mask.float()
 
     def get_metric_depth(self, img: Float[torch.Tensor, "b 3 h w"]):
         batch, channel, height, width = img.shape
@@ -412,12 +304,7 @@ class HumanComposer(nn.Module):
         assert ground_mask.shape == (batch, 1, h, w)
 
         # metric depth & focal_len
-        if self.use_depthpro:
-            prediction = self.depth_pro_model.infer(2 * bkg - 1, f_px=None)
-            metric_depth = prediction["depth"].reshape(batch, h, w)  # Depth in [m].
-            cam_focal_len = prediction["focallength_px"]
-        else:
-            metric_depth, cam_focal_len = self.get_metric_depth(bkg)
+        metric_depth, cam_focal_len = self.get_metric_depth(bkg)
         if self.verbose:
             print(f"[HumanComposer] configure: {cam_focal_len=}")
 
@@ -531,6 +418,8 @@ class HumanComposer(nn.Module):
         human = self.generate_human(batch=img.shape[0], device=img.device)
         segmask = self.segment_human(human)
         ground_mask = self.segment_ground(img)
+        if torch.all(ground_mask < 0.01):
+            raise HumanCompositionError("No ground found")
         ret, ret_mask, metric_depth = self.configure(human, segmask, img, ground_mask)
         ret = self.harmonize(ret, ret_mask)
         return ret, ret_mask, ground_mask, metric_depth
