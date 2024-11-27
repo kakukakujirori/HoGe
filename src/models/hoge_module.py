@@ -11,6 +11,7 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 
 from src.models.components.configure_camera import ConfigureCamera
 from src.models.components.hoge_model import HoGeModel
+from src.models.components.lama_inpainter import LamaInpainter
 from src.models.components.moge_mesh import MoGeMesh
 from src.models.components.render_mesh import RenderMesh
 from src.models.losses.optimal_alignment_loss import OptimalAlignmentLoss
@@ -54,6 +55,7 @@ class HoGeModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         gather_layers_before_inference: bool,
+        inpaint_invalid_input_area: bool,
         log_images_every_n_steps: int = -1,
         compile: bool = True,
     ) -> None:
@@ -74,6 +76,7 @@ class HoGeModule(LightningModule):
             background_alpha=0.75
         )  # NOTE: When processing with HoGe, sky region is a 'valid' region, but an 'invalid' region when calculating render_masks
         self.mesh_renderer = RenderMesh(layer_num=net.max_points_per_ray, void_alpha=0.0)
+        self.inpainter = LamaInpainter()
 
         # freeze MoGeMesh weights
         for param in self.mesh_generator.parameters():
@@ -108,7 +111,7 @@ class HoGeModule(LightningModule):
     @torch.inference_mode()
     def generate_pseudo_gt(
         self,
-        image: Float[torch.Tensor, "b h w c"],
+        image: Float[torch.Tensor, "b h w 3"],
     ) -> tuple[
         Float[torch.Tensor, "b h w layers 4"],
         Float[torch.Tensor, "b h w layers 3"],
@@ -118,32 +121,52 @@ class HoGeModule(LightningModule):
         self.mesh_generator.eval()
         self.camera_configurator.eval()
         self.mesh_renderer.eval()
+        self.inpainter.eval()
 
         batch, height, width, channel = image.shape
         assert channel == 3, f"{image.shape=}"
-        intrinsics, meshes, points_original = self.mesh_generator(
-            image
-        )  # (b, 3, 3), Meshes, (b, h, w, 3)
-        camera = self.camera_configurator(intrinsics, image, points_original)
-        texels_rendered, depths_rendered = self.mesh_renderer(
-            meshes, camera
-        )  # (b, h, w, layers, 4), (b, h, w, layers)
 
-        # unproject depths_rendered to points_rendered
-        uv_coord = utils3d.torch.image_uv(
-            width=width, height=height, dtype=image.dtype, device=image.device
-        )
-        points_rendered = torch.cat([uv_coord, torch.ones_like(uv_coord[..., :1])], dim=-1)
-        points_rendered = points_rendered @ torch.inverse(
-            intrinsics.reshape(batch, 1, 3, 3)
-        ).transpose(
-            -2, -1
-        )  # (h, w, 3) @ (b, 1, 3, 3) => (b, h, w, 3)
-        points_rendered = points_rendered.reshape(
-            batch, height, width, 1, 3
-        ) * depths_rendered.reshape(
-            batch, height, width, -1, 1
-        )  # (b, h, w, 1, 3) * (b, h, w, layers, 1) => (b, h, w, layers, 3)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            intrinsics, meshes, points_original = self.mesh_generator(
+                image
+            )  # (b, 3, 3), Meshes, (b, h, w, 3)
+            camera = self.camera_configurator(intrinsics, image, points_original)
+
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            # PyTorch3D doesn't support float16
+            texels_rendered, depths_rendered = self.mesh_renderer(
+                meshes, camera
+            )  # (b, h, w, layers, 4), (b, h, w, layers)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # unproject depths_rendered to points_rendered
+            uv_coord = utils3d.torch.image_uv(
+                width=width, height=height, dtype=image.dtype, device=image.device
+            )
+            points_rendered = torch.cat([uv_coord, torch.ones_like(uv_coord[..., :1])], dim=-1)
+            points_rendered = points_rendered @ torch.inverse(
+                intrinsics.reshape(batch, 1, 3, 3)
+            ).transpose(
+                -2, -1
+            )  # (h, w, 3) @ (b, 1, 3, 3) => (b, h, w, 3)
+            points_rendered = points_rendered.reshape(
+                batch, height, width, 1, 3
+            ) * depths_rendered.reshape(
+                batch, height, width, -1, 1
+            )  # (b, h, w, 1, 3) * (b, h, w, layers, 1) => (b, h, w, layers, 3)
+
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            # inpaint invalid region
+            if self.hparams.inpaint_invalid_input_area:
+                img_rendered, mask_rendered = (
+                    texels_rendered[:, :, :, 0, :].permute(0, 3, 1, 2).split([3, 1], dim=1)
+                )
+                img_inpainted = self.inpainter(
+                    img_rendered, (mask_rendered < 0.5).to(img_rendered.dtype)
+                )
+                texels_rendered[:, :, :, 0, :] = torch.cat(
+                    [img_inpainted, mask_rendered], dim=1
+                ).permute(0, 2, 3, 1)
 
         return texels_rendered, points_rendered, points_original
 

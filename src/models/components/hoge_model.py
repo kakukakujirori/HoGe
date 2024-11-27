@@ -443,10 +443,9 @@ class HoGeModel(nn.Module):
             invalid_mask_14 = None
 
         # Get intermediate layers from the backbone
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=mixed_precision):
-            features = self.backbone.get_intermediate_layers(
-                image_14, invalid_mask_14, self.intermediate_layers, return_class_token=True
-            )
+        features = self.backbone.get_intermediate_layers(
+            image_14, invalid_mask_14, self.intermediate_layers, return_class_token=True
+        )
 
         # Predict points, mask and so on
         output = self.head(
