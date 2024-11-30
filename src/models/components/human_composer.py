@@ -80,7 +80,7 @@ class HumanComposer(nn.Module):
     ):
         assert noise_mode in ["const", "random", "none"]
         label = torch.zeros([batch, self.stylegan_human.c_dim], device=device)
-        z = torch.from_numpy(np.random.randn(batch, self.stylegan_human.z_dim)).to(device)
+        z = torch.randn(batch, self.stylegan_human.z_dim, dtype=torch.float32, device=device)
         w = self.stylegan_human.mapping(z, label, truncation_psi=truncation_psi)
         human = self.stylegan_human.synthesis(w, noise_mode=noise_mode, force_fp32=True)
         human = torch.clip((human + 1) / 2, 0, 1)  # (-1, 1) -> (0, 1)
@@ -211,16 +211,21 @@ class HumanComposer(nn.Module):
         )
         return ground_mask.float()
 
-    def get_metric_depth(self, img: Float[torch.Tensor, "b 3 h w"]):
+    def get_metric_depth(
+        self,
+        img: Float[torch.Tensor, "b 3 h w"],
+        cam_focal_len: Float[torch.Tensor, " b"] = None,
+    ):
         batch, channel, height, width = img.shape
         assert channel == 3
 
         # calibration
-        cam_focal_len = []
-        for b in range(batch):
-            calib_result = self.geocalib.calibrate(img[b])
-            cam_focal_len.append(calib_result["camera"].f.mean())
-        cam_focal_len = torch.stack(cam_focal_len)
+        if cam_focal_len is None:
+            cam_focal_len = []
+            for b in range(batch):
+                calib_result = self.geocalib.calibrate(img[b])
+                cam_focal_len.append(calib_result["camera"].f.mean())
+            cam_focal_len = torch.stack(cam_focal_len)
 
         # metric3d
         input_size = (616, 1064)  # for vit model
@@ -325,24 +330,9 @@ class HumanComposer(nn.Module):
         human_pixel_height = human_actual_height * cam_focal_len / human_depth
 
         # human foot position
-        human_mask_vertical = torch.any(human_mask > 0.5, dim=-1)
-        human_mask_horizontal = torch.any(human_mask > 0.5, axis=-2)
-
-        mask_vertical_idx, _, mask_vertical_px = human_mask_vertical.nonzero(as_tuple=True)
-        foot_pos_in_fg_y = mask_vertical_px[
-            mask_vertical_idx.bincount().cumsum(dim=0) - 1
-        ]  # lowest pixel
-
-        mask_horizontal_idx, _, mask_horizontal_px = human_mask_horizontal.nonzero(as_tuple=True)
-        foot_pos_in_fg_x = torch.bincount(
-            mask_horizontal_idx, weights=mask_horizontal_px
-        ) / torch.bincount(mask_horizontal_idx)
-
-        foot_pos_in_fg = torch.stack([foot_pos_in_fg_y, foot_pos_in_fg_x], dim=-1)
-        current_human_pixel_height = torch.sum(
-            human_mask_vertical.reshape(batch, h_human), dim=1
-        )  # NOTE: Should be more sophisticated
-        assert foot_pos_in_fg.shape == (batch, 2)
+        foot_pos_in_fg, current_human_pixel_height = get_human_foot_pixel_coord_and_height(
+            human_mask
+        )
 
         # base result
         ret = bkg.clone()
@@ -361,27 +351,36 @@ class HumanComposer(nn.Module):
                 human_mask[b : b + 1], scale_factor=scale_factor[b].item(), mode="bilinear"
             ).squeeze(0)
 
-            # these can be outside the image region
-            bbox_up = foot_pos_in_bg[b][0] - foot_pose_in_fg_resize[b][0]
-            bbox_down = foot_pos_in_bg[b][0] + (
-                human_resized.shape[-2] - foot_pose_in_fg_resize[b][0]
-            )
-            bbox_left = foot_pos_in_bg[b][1] - foot_pose_in_fg_resize[b][1]
-            bbox_right = foot_pos_in_bg[b][1] + (
-                human_resized.shape[-1] - foot_pose_in_fg_resize[b][1]
-            )
+            # # these can be outside the image region
+            # bbox_up = foot_pos_in_bg[b][0] - foot_pose_in_fg_resize[b][0]
+            # bbox_down = foot_pos_in_bg[b][0] + (
+            #     human_resized.shape[-2] - foot_pose_in_fg_resize[b][0]
+            # )
+            # bbox_left = foot_pos_in_bg[b][1] - foot_pose_in_fg_resize[b][1]
+            # bbox_right = foot_pos_in_bg[b][1] + (
+            #     human_resized.shape[-1] - foot_pose_in_fg_resize[b][1]
+            # )
 
-            # corresponding foreground
-            bbox_fg_up = max(0, -bbox_up)
-            bbox_fg_down = human_resized.shape[-2] - max(0, bbox_down - h)
-            bbox_fg_left = max(0, -bbox_left)
-            bbox_fg_right = human_resized.shape[-1] - max(0, bbox_right - w)
+            # # corresponding foreground
+            # bbox_fg_up = max(0, -bbox_up)
+            # bbox_fg_down = human_resized.shape[-2] - max(0, bbox_down - h)
+            # bbox_fg_left = max(0, -bbox_left)
+            # bbox_fg_right = human_resized.shape[-1] - max(0, bbox_right - w)
 
-            # limit bbox inside the image region
-            bbox_up = max(0, bbox_up)
-            bbox_down = min(h, bbox_down)
-            bbox_left = max(0, bbox_left)
-            bbox_right = min(w, bbox_right)
+            # # limit bbox inside the image region
+            # bbox_up = max(0, bbox_up)
+            # bbox_down = min(h, bbox_down)
+            # bbox_left = max(0, bbox_left)
+            # bbox_right = min(w, bbox_right)
+
+            bbox, bbox_fg, valid = get_overlap_rect_corners(
+                bkg[b : b + 1],
+                foot_pos_in_bg[b : b + 1],
+                human_resized.unsqueeze(0),
+                foot_pose_in_fg_resize[b : b + 1],
+            )
+            bbox_up, bbox_left, bbox_down, bbox_right = bbox.squeeze(0)
+            bbox_fg_up, bbox_fg_left, bbox_fg_down, bbox_fg_right = bbox_fg.squeeze(0)
 
             human_cropped = human_resized[:, bbox_fg_up:bbox_fg_down, bbox_fg_left:bbox_fg_right]
             human_mask_cropped = human_mask_resized[
@@ -423,3 +422,112 @@ class HumanComposer(nn.Module):
         ret, ret_mask, metric_depth = self.configure(human, segmask, img, ground_mask)
         ret = self.harmonize(ret, ret_mask)
         return ret, ret_mask, ground_mask, metric_depth
+
+
+def get_human_foot_pixel_coord_and_height(
+    human_mask: Float[torch.Tensor, "b 1 h w"],
+    index: str = "ij",
+):
+    batch, channel, height, width = human_mask.shape
+    assert channel == 1
+
+    human_mask_vertical = torch.any(human_mask > 0.5, dim=-1)
+    human_mask_horizontal = torch.any(human_mask > 0.5, axis=-2)
+
+    mask_vertical_idx, _, mask_vertical_px = human_mask_vertical.nonzero(as_tuple=True)
+    foot_pos_in_fg_y = mask_vertical_px[
+        mask_vertical_idx.bincount().cumsum(dim=0) - 1
+    ]  # lowest pixel
+
+    mask_horizontal_idx, _, mask_horizontal_px = human_mask_horizontal.nonzero(as_tuple=True)
+    foot_pos_in_fg_x = torch.bincount(
+        mask_horizontal_idx, weights=mask_horizontal_px
+    ) / torch.bincount(mask_horizontal_idx)
+
+    foot_pos_in_fg = torch.stack([foot_pos_in_fg_y, foot_pos_in_fg_x], dim=-1)
+    current_human_pixel_height = torch.sum(
+        human_mask_vertical.reshape(batch, height), dim=1
+    )  # NOTE: Should be more sophisticated
+    assert foot_pos_in_fg.shape == (batch, 2)
+
+    if index == "ij":
+        pass
+    elif index == "xy":
+        foot_pos_in_fg = torch.flip(foot_pos_in_fg, dims=(1,))
+    else:
+        raise ValueError(f"Invalid {index=}")
+
+    return foot_pos_in_fg.to(human_mask.dtype), current_human_pixel_height
+
+
+def get_overlap_rect_corners(
+    img1: Float[torch.Tensor, "b c h1 w1"],
+    img1_align_pt: Float[torch.Tensor, "b 2"],
+    img2: Float[torch.Tensor, "b c h2 w2"],
+    img2_align_pt: Float[torch.Tensor, "b 2"],
+    index: str = "ij",
+) -> tuple[Float[torch.Tensor, "b 4"], Float[torch.Tensor, "b 4"], Float[torch.Tensor, "b 1"]]:
+    """Overlay img1 and img2 so that img1_align_pts and img2_align_pts are the same position.
+
+    The returned values [si1 ,sj1, ti1, tj1], [si2, sj2, ti2, tj2], and 'valid' are used as
+    img1[si1:ti1, sj1:tj1] = img2[si2:ti2, sj2:tj2] If not 'valid', there is no overlap and [si1
+    ,sj1, ti1, tj1] = [si2, sj2, ti2, tj2] = [-1, -1, -1, -1]
+    """
+    dtype, device = img1.dtype, img1.device
+    batch1, channel1, height1, width1 = img1.shape
+    batch2, channel2, height2, width2 = img2.shape
+    assert img1_align_pt.shape == (batch1, 2), f"{img1.shape=}, {img1_align_pt.shape=}"
+    assert img2_align_pt.shape == (batch2, 2), f"{img2.shape=}, {img2_align_pt.shape=}"
+    assert batch1 == batch2 and channel1 == channel2, f"{img1.shape=}, {img2.shape=}"
+    assert index in ["ij", "xy"]
+
+    if index == "xy":
+        img1_align_pt = torch.flip(img1_align_pt, dims=(-1,))
+        img2_align_pt = torch.flip(img2_align_pt, dims=(-1,))
+
+    def get_img1_overlayed_bbox_corners(
+        img1: Float[torch.Tensor, "b c h1 w1"],
+        img1_align_pt: Float[torch.Tensor, "b 2"],
+        img2: Float[torch.Tensor, "b c h2 w2"],
+        img2_align_pt: Float[torch.Tensor, "b 2"],
+    ):
+        _, _, height1, width1 = img1.shape
+        _, _, height2, width2 = img2.shape
+
+        # get the img2's four corner coordinates in the img1 coordinate system
+        sisj = img1_align_pt - img2_align_pt
+        titj = sisj + torch.tensor([height2, width2], dtype=dtype, device=device)
+
+        # conform inside img1
+        sisj.clamp_min_(0)
+        titj[:, 0].clamp_max_(height1)
+        titj[:, 1].clamp_max_(width1)
+
+        return sisj, titj
+
+    sisj_1, titj_1 = get_img1_overlayed_bbox_corners(img1, img1_align_pt, img2, img2_align_pt)
+    sisj_2, titj_2 = get_img1_overlayed_bbox_corners(img2, img2_align_pt, img1, img1_align_pt)
+    ret_1 = torch.cat([sisj_1, titj_1], dim=-1)
+    ret_2 = torch.cat([sisj_2, titj_2], dim=-1)
+
+    valid_overlay = torch.logical_and(
+        torch.logical_and(sisj_1[:, 0] <= height1, sisj_1[:, 1] <= width1),
+        torch.logical_and(titj_1[:, 0] >= 0, titj_1[:, 1] >= 0),
+    )
+    ret_1[~valid_overlay] = -1
+    ret_2[~valid_overlay] = -1
+
+    # sanity check
+    assert torch.allclose(ret_1[:, 2:4] - ret_1[:, 0:2], ret_2[:, 2:4] - ret_2[:, 0:2])
+
+    ret_1 = ret_1.round().long()
+    ret_2 = ret_2.round().long()
+    assert torch.allclose(ret_1[:, 2:4] - ret_1[:, 0:2], ret_2[:, 2:4] - ret_2[:, 0:2])
+
+    if index == "xy":
+        ret_1[:, 0:2] = torch.flip(ret_1[:, 0:2], dims=(-1,))
+        ret_1[:, 2:4] = torch.flip(ret_1[:, 2:4], dims=(-1,))
+        ret_2[:, 0:2] = torch.flip(ret_2[:, 0:2], dims=(-1,))
+        ret_2[:, 2:4] = torch.flip(ret_2[:, 2:4], dims=(-1,))
+
+    return ret_1, ret_2, valid_overlay.reshape(batch1, 1)
