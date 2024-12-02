@@ -282,18 +282,23 @@ class HumanComposer3D(nn.Module):
     ) -> Float[torch.Tensor, "b 1 h w"]:
         predicted_semantic_map = self.run_oneformer(img)
         # In ADE20K
-        ground_mask = (
-            (predicted_semantic_map == 3)  # 3 => floor
-            + (predicted_semantic_map == 6)  # 6 => road, route
-            + (predicted_semantic_map == 9)  # 9 => grass
-            + (predicted_semantic_map == 11)  # 11 => sidewalk, pavement
-            + (predicted_semantic_map == 13)  # 13 => earth, ground
-            + (predicted_semantic_map == 28)  # 28 => rug
-            + (predicted_semantic_map == 53)  # 53 => stairs
-            + (predicted_semantic_map == 59)  # 59 => stairway, staircase
-            + (predicted_semantic_map == 96)  # 96 => escalator, moving staircase, moving stairway
-            + (predicted_semantic_map == 121)  # 121 => step, stair
+        labels = torch.tensor(
+            [
+                3,  # 3 => floor
+                6,  # 6 => road, route
+                9,  # 9 => grass
+                11,  # 11 => sidewalk, pavement
+                13,  # 13 => earth, ground
+                28,  # 28 => rug
+                53,  # 53 => stairs
+                59,  # 59 => stairway, staircase
+                96,  # 96 => escalator, moving staircase, moving stairway
+                121,  # 121 => step, stair
+            ],
+            dtype=predicted_semantic_map.dtype,
+            device=predicted_semantic_map.device,
         )
+        ground_mask = torch.isin(predicted_semantic_map, labels)
         return ground_mask.float()
 
     def generate_human(
@@ -490,11 +495,11 @@ class HumanComposer3D(nn.Module):
 
         return foot_pos_in_fg.to(human_mask.dtype), current_human_pixel_height
 
-    @staticmethod
     def place_a_human_in_the_scene(
+        self,
         human: Float[torch.Tensor, "b 3 h w"],
         human_mask: Float[torch.Tensor, "b 1 h w"],
-        bkg_metric_points: Float[torch.Tensor, "b h_bkg w_bkg 3"],
+        bkg_metric_depth: Float[torch.Tensor, "b h_bkg w_bkg"],
         plane_coeff: Float[torch.Tensor, "b 4"],
         cam_focal_len: float,
         return_mesh: bool = True,  # if False, human point cloud is returned
@@ -514,17 +519,24 @@ class HumanComposer3D(nn.Module):
         human_actual_height = torch.normal(
             1.7, 0.07, (batch,), dtype=human.dtype, device=human.device
         )
-        human_depth = torch.empty_like(human_actual_height).uniform_(1.0, 5.0)
-        """Put a human on the intersection line of ax+by+cz+d=0 (plane_eq) and z=human_depth Note
-        that nearly a=c=0 in most cases.
+        human_min_depth = 1.0
+        human_max_depth = torch.max(bkg_metric_depth.reshape(batch, -1), dim=1).values.clamp(
+            human_min_depth, 5.0
+        )
+        human_depth = human_min_depth + torch.rand_like(human_actual_height) * (
+            human_max_depth - human_min_depth
+        )
+        if self.verbose:
+            print(f"[place_a_human_in_the_scene] {human_actual_height=}\n{human_depth=}")
+        """Put a human on the intersection line of ax+by+cz+d=0 (plane_eq) and z=human_depth.
+        Note that nearly a=c=0 in most cases.
 
-        the intersection line is parametrized by (x, (d - c*human_depth - ax) / b, human_depth)
+        The intersection line is parametrized by (x, (d - c*human_depth - ax) / b, human_depth)
         The free variable x is constrained by the camera FoV.
         """
         # foot position in 3D space
-        bkg_batch, bkg_height, bkg_width, bkg_channel = bkg_metric_points.shape
+        bkg_batch, bkg_height, bkg_width = bkg_metric_depth.shape
         assert batch == bkg_batch
-        assert bkg_channel == 3
         foot_pos_in_bg_x_max = (bkg_width / 2) * human_depth / cam_focal_len
         foot_pos_in_bg_x = (torch.rand_like(human_depth) * 2 - 1) * foot_pos_in_bg_x_max
         foot_pos_in_bg_y = (-PD - PC * human_depth - PA * foot_pos_in_bg_x) / PB
@@ -718,7 +730,7 @@ class HumanComposer3D(nn.Module):
 
         # Step7. Place the human in the scene
         human_mesh = self.place_a_human_in_the_scene(
-            human, human_mask, moge_metric_points, plane_coeff, cam_focal_len, return_mesh=True
+            human, human_mask, moge_metric_depth, plane_coeff, cam_focal_len, return_mesh=True
         )
 
         # Step8. Render the human
