@@ -150,7 +150,7 @@ class SimpleShaderWithMask(torch.nn.Module):
     def forward(self, fragments, meshes, **kwargs) -> torch.Tensor:
         blend_params = kwargs.get("blend_params", self.blend_params)
         texels = meshes.sample_textures(fragments)  # [N, H, W, K, 4]
-        return texels[..., 0, :]  # (N, H, W, 4) RGBA image
+        return texels[..., 0, :], fragments.zbuf[..., 0]  # (N, H, W, 4) RGBA image
 
 
 class AlphaCompositionShader(torch.nn.Module):
@@ -167,24 +167,33 @@ class AlphaCompositionShader(torch.nn.Module):
 
         # Perform alpha compositing
         # This is a basic over-compositing approach
-        # Assumes front-to-back rendering order
-        composite_image = torch.ones_like(pixel_colors[..., 0, :3])
+        # Assumes back-to-front rendering order
+        composite_image = torch.zeros_like(pixel_colors[..., 0, :])
         composite_image[..., 0] = self.blend_params.background_color[0]
         composite_image[..., 1] = self.blend_params.background_color[1]
         composite_image[..., 2] = self.blend_params.background_color[2]
 
+        composite_depth = torch.where(
+            fragments.zbuf[..., -1] > 0,
+            fragments.zbuf[..., -1],
+            fragments.zbuf[..., -1].flatten(1).max(dim=1).values.reshape(-1, 1, 1),
+        )
+
         # Iterate through the K samples (typically from rasterization)
-        for k in range(pixel_colors.shape[3]):
+        for k in range(pixel_colors.shape[3] - 1, -1, -1):
             # Current layer's color and alpha
             layer_color = pixel_colors[..., k, :3]
             layer_alpha = alphas[..., k]
+            layer_depth = fragments.zbuf[..., k]
 
             # Blend with previous composite
-            composite_image = layer_color * layer_alpha[..., None] + composite_image * (
-                1 - layer_alpha[..., None]
-            )
+            composite_image[..., :3] = layer_color * layer_alpha[..., None] + composite_image[
+                ..., :3
+            ] * (1 - layer_alpha[..., None])
+            composite_image[..., 3] = torch.maximum(layer_alpha, composite_image[..., 3])
+            composite_depth = layer_depth * layer_alpha + composite_depth * (1 - layer_alpha)
 
-        return composite_image
+        return composite_image, composite_depth
 
 
 class MeshRendererWithDepth(torch.nn.Module):
@@ -195,8 +204,8 @@ class MeshRendererWithDepth(torch.nn.Module):
 
     def forward(self, meshes_world, **kwargs) -> torch.Tensor:
         fragments = self.rasterizer(meshes_world, **kwargs)
-        images = self.shader(fragments, meshes_world, **kwargs)
-        return images, fragments.zbuf[..., 0]
+        images, depths = self.shader(fragments, meshes_world, **kwargs)
+        return images, depths
 
 
 # <<< Human Renderer Classes <<<
@@ -205,9 +214,12 @@ class MeshRendererWithDepth(torch.nn.Module):
 class HumanComposer3D(nn.Module):
     def __init__(
         self,
+        max_human_num: int = 5,
         verbose: bool = False,
     ):
         super().__init__()
+        assert max_human_num > 0
+        self.max_human_num = max_human_num
         self.verbose = verbose
 
         # StyleGAN-Human
@@ -302,11 +314,13 @@ class HumanComposer3D(nn.Module):
         return ground_mask.float()
 
     def generate_human(
-        self, batch: int, truncation_psi: float = 1.0, noise_mode: str = "const", device="cuda"
-    ):
+        self, truncation_psi: float = 1.0, noise_mode: str = "const", device="cuda"
+    ) -> Float[torch.Tensor, "max_human_num 3 1024 512"]:
         assert noise_mode in ["const", "random", "none"]
-        label = torch.zeros([batch, self.stylegan_human.c_dim], device=device)
-        z = torch.randn(batch, self.stylegan_human.z_dim, dtype=torch.float32, device=device)
+        label = torch.zeros([self.max_human_num, self.stylegan_human.c_dim], device=device)
+        z = torch.randn(
+            self.max_human_num, self.stylegan_human.z_dim, dtype=torch.float32, device=device
+        )
         w = self.stylegan_human.mapping(z, label, truncation_psi=truncation_psi)
         human = self.stylegan_human.synthesis(w, noise_mode=noise_mode, force_fp32=True)
         human = torch.clip((human + 1) / 2, 0, 1)  # (-1, 1) -> (0, 1)
@@ -495,132 +509,154 @@ class HumanComposer3D(nn.Module):
 
         return foot_pos_in_fg.to(human_mask.dtype), current_human_pixel_height
 
-    def place_a_human_in_the_scene(
+    def place_humans_in_the_scene(
         self,
-        human: Float[torch.Tensor, "b 3 h w"],
-        human_mask: Float[torch.Tensor, "b 1 h w"],
+        humans: Float[torch.Tensor, "b_human 3 h w"],
+        humans_mask: Float[torch.Tensor, "b_human 1 h w"],
         bkg_metric_depth: Float[torch.Tensor, "b h_bkg w_bkg"],
         plane_coeff: Float[torch.Tensor, "b 4"],
-        cam_focal_len: float,
+        cam_focal_len: Float[torch.Tensor, " b"],
         return_mesh: bool = True,  # if False, human point cloud is returned
-    ) -> Float[torch.Tensor, "b h w 3"]:
-        human_alpha_ch_last = torch.cat([human, human_mask], dim=1).permute(0, 2, 3, 1)
-        batch, human_height, human_width, _ = human_alpha_ch_last.shape
-        PA = plane_coeff[:, 0]
-        PB = plane_coeff[:, 1]
-        PC = plane_coeff[:, 2]
-        PD = plane_coeff[:, 3]
+    ) -> Float[torch.Tensor, "b b_human h w 3"] | Meshes:
+        """All the humans are pasted in each of the background scene."""
+        bkg_batch, bkg_height, bkg_width = bkg_metric_depth.shape
+        human_batch, _, human_height, human_width = humans.shape
+
+        human_alpha_ch_last = torch.cat([humans, humans_mask], dim=1).permute(0, 2, 3, 1)
+
+        PA, PB, PC, PD = torch.split(plane_coeff, 1, dim=1)
+        assert PA.shape == (bkg_batch, 1), f"{PA.shape=}"
         ground_normal = plane_coeff[:, :3]
 
         foot_pos_in_fg, current_human_pixel_height = (
-            __class__.get_human_foot_pixel_coord_and_height(human_mask, index="xy")
+            __class__.get_human_foot_pixel_coord_and_height(humans_mask, index="xy")
         )
 
-        human_actual_height = torch.normal(
-            1.7, 0.07, (batch,), dtype=human.dtype, device=human.device
+        humans_actual_height = torch.normal(
+            1.7, 0.07, (human_batch,), dtype=humans.dtype, device=humans.device
         )
-        human_min_depth = 1.0
-        human_max_depth = torch.max(bkg_metric_depth.reshape(batch, -1), dim=1).values.clamp(
-            human_min_depth, 5.0
-        )
-        human_depth = human_min_depth + torch.rand_like(human_actual_height) * (
-            human_max_depth - human_min_depth
-        )
+        humans_min_depth = 1.0
+        humans_max_depth = torch.max(bkg_metric_depth.reshape(bkg_batch, -1), dim=1).values.clamp(
+            humans_min_depth, 5.0
+        )  # (bkg_batch,)
+        humans_depth = humans_min_depth + torch.rand(
+            (bkg_batch, human_batch), dtype=humans.dtype, device=humans.device
+        ) * (humans_max_depth - humans_min_depth).reshape(
+            bkg_batch, 1
+        )  # (bkg_batch, human_batch)
+        assert humans_depth.shape == (bkg_batch, human_batch)
         if self.verbose:
-            print(f"[place_a_human_in_the_scene] {human_actual_height=}\n{human_depth=}")
-        """Put a human on the intersection line of ax+by+cz+d=0 (plane_eq) and z=human_depth.
+            print(f"[place_humans_in_the_scene] {humans_actual_height=}\n{humans_depth=}")
+
+        """Put humans on the intersection line of ax+by+cz+d=0 (plane_eq) and z=humans_depth.
         Note that nearly a=c=0 in most cases.
 
-        The intersection line is parametrized by (x, (d - c*human_depth - ax) / b, human_depth)
+        The intersection line is parametrized by (x, (d - c * humans_depth - ax) / b, humans_depth)
         The free variable x is constrained by the camera FoV.
         """
         # foot position in 3D space
-        bkg_batch, bkg_height, bkg_width = bkg_metric_depth.shape
-        assert batch == bkg_batch
-        foot_pos_in_bg_x_max = (bkg_width / 2) * human_depth / cam_focal_len
-        foot_pos_in_bg_x = (torch.rand_like(human_depth) * 2 - 1) * foot_pos_in_bg_x_max
-        foot_pos_in_bg_y = (-PD - PC * human_depth - PA * foot_pos_in_bg_x) / PB
-        foot_pos_in_bg = torch.stack([foot_pos_in_bg_x, foot_pos_in_bg_y, human_depth], dim=-1)
-
-        # define the whole body points in 3D (metric depth is correct in all directions x, y, andz)
-        scale_factor = human_actual_height / current_human_pixel_height
+        foot_pos_in_bg_x_max = (bkg_width / 2) * humans_depth / cam_focal_len.reshape(bkg_batch, 1)
+        foot_pos_in_bg_x = (torch.rand_like(humans_depth) * 2 - 1) * foot_pos_in_bg_x_max
+        foot_pos_in_bg_y = (-PD - PC * humans_depth - PA * foot_pos_in_bg_x) / PB
+        foot_pos_in_bg = torch.stack([foot_pos_in_bg_x, foot_pos_in_bg_y, humans_depth], dim=-1)
+        assert foot_pos_in_bg.shape == (bkg_batch, human_batch, 3), f"{foot_pos_in_bg.shape=}"
 
         # define the whole body points in 3D plane, PARPENDICULAR TO THE PRINCIPAL AXIS for ease
         # (NOTE: metric depth is correct in all directions x, y, and z)
-        scale_factor = human_actual_height / current_human_pixel_height
+        scale_factor = humans_actual_height / current_human_pixel_height
         human_pixels = (
             torch.stack(
                 torch.meshgrid(
                     [
-                        torch.linspace(0, human_width - 1, human_width, device=human.device),
-                        torch.linspace(0, human_height - 1, human_height, device=human.device),
+                        torch.linspace(0, human_width - 1, human_width, device=humans.device),
+                        torch.linspace(0, human_height - 1, human_height, device=humans.device),
                     ],
                     indexing="xy",
                 ),
                 dim=-1,
             )
             .reshape(1, -1, 2)
-            .repeat(batch, 1, 1)
+            .repeat(human_batch, 1, 1)
         )
 
         human_points_plane_xy = (
-            human_pixels - foot_pos_in_fg.reshape(batch, 1, 2)
-        ) * scale_factor.reshape(batch, 1, 1)
+            human_pixels - foot_pos_in_fg.reshape(human_batch, 1, 2)
+        ) * scale_factor.reshape(human_batch, 1, 1)
         human_points_plane_z = torch.zeros_like(human_points_plane_xy[..., 0:1])
-        human_points_plane = torch.cat([human_points_plane_xy, human_points_plane_z], dim=-1)
-        human_points = foot_pos_in_bg.reshape(batch, 1, 3) + human_points_plane
+        human_points_foot_origin = torch.cat([human_points_plane_xy, human_points_plane_z], dim=-1)
+        assert human_points_foot_origin.shape == (
+            human_batch,
+            human_height * human_width,
+            3,
+        ), f"{human_points_foot_origin.shape=}"
 
-        # rotate the human plane so the body axis aligns with the ground normal with the foot point fixed
-        initial_normal = torch.zeros(
-            batch, 3, dtype=ground_normal.dtype, device=ground_normal.device
-        )
+        # rotate the human planes so the body axis aligns with the ground normal with the foot point fixed
+        initial_normal = torch.zeros((bkg_batch, 3), dtype=humans.dtype, device=humans.device)
         initial_normal[:, 1] = torch.sign(ground_normal[:, 1])
         target_normal = F.normalize(ground_normal, dim=1)
         rotation_axis = F.normalize(torch.linalg.cross(initial_normal, target_normal), dim=1)
-        angle = torch.acos(torch.sum(initial_normal * target_normal, dim=1))
-        rotmat = axis_angle_to_matrix(angle.reshape(batch, 1) * rotation_axis)
+        angle = torch.acos(torch.sum(initial_normal * target_normal, dim=1, keepdim=True))
+        rotmat = axis_angle_to_matrix(angle * rotation_axis)  # (bkg_batch, 3, 3)
         human_points = (
-            rotmat.reshape(batch, 1, 3, 3)
-            @ (human_points - foot_pos_in_bg.reshape(batch, 1, 3)).reshape(batch, -1, 3, 1)
-        ).squeeze(-1) + foot_pos_in_bg.reshape(batch, 1, 3)
+            rotmat.reshape(bkg_batch, 1, 3, 3)
+            @ human_points_foot_origin.reshape(1, human_batch * human_height * human_width, 3, 1)
+        ).reshape(bkg_batch, human_batch, human_height * human_width, 3) + foot_pos_in_bg.reshape(
+            bkg_batch, human_batch, 1, 3
+        )
+        assert human_points.shape == (bkg_batch, human_batch, human_height * human_width, 3)
 
         if not return_mesh:
-            return human_points.reshape(batch, human_height, human_width, 3)
+            return human_points.reshape(bkg_batch, human_batch, human_height, human_width, 3)
 
-        # pack into a mesh
-        faces_list = []
-        verts_list = []
-        vert_uv_list = []
-        for b in range(batch):  # TODO: OPTIMIZE image_mesh()
-            faces, vertices, vertex_colors, vertex_uvs = image_mesh(
-                human_points[b].reshape(human_height, human_width, 3),
-                human_alpha_ch_last[b],
-                utils3d.torch.image_uv(
-                    height=human_height, width=human_width, device=human.device
-                ),
-                mask=None,  # (mask & ~depth_edge) if invalid_mesh_color is None else mask,
-                tri=True,
-            )
-            vertex_uvs[:, 1] = 1 - vertex_uvs[:, 1]
-            faces_list.append(faces)
-            verts_list.append(vertices)
-            vert_uv_list.append(vertex_uvs)
-
-        faces_list = torch.stack(faces_list)
-        verts_list = torch.stack(verts_list)
-        vert_uv_list = torch.stack(vert_uv_list)
-
-        # Create a textures object
-        tex_list = TexturesUV(
-            maps=human_alpha_ch_last,
-            faces_uvs=faces_list,
-            verts_uvs=vert_uv_list,
-            align_corners=False,
+        # instantiate all the humans in a mesh
+        faces_per_person, vertex_uvs_per_person = image_mesh(
+            utils3d.torch.image_uv(height=human_height, width=human_width, device=humans.device),
+            mask=None,  # (mask & ~depth_edge) if invalid_mesh_color is None else mask,
+            tri=True,
         )
-        return Meshes(verts=verts_list, faces=faces_list, textures=tex_list)
+        faces_offsets = torch.arange(
+            0,
+            human_batch * human_height * human_width,
+            human_height * human_width,
+            device=faces_per_person.device,
+        ).reshape(-1, 1, 1)
+        faces_per_scene = faces_per_person.reshape(1, -1, 3) + faces_offsets
 
-    @staticmethod
+        vertex_uvs_offsets = torch.arange(
+            human_batch, dtype=vertex_uvs_per_person.dtype, device=vertex_uvs_per_person.device
+        ).reshape(human_batch, 1, 1)
+        vertex_uvs_offsets = torch.cat(
+            [vertex_uvs_offsets, torch.zeros_like(vertex_uvs_offsets)], dim=-1
+        )  # (human_batch, 1, 2)
+        vertex_uvs_per_scene = (
+            vertex_uvs_per_person.reshape(1, -1, 2) + vertex_uvs_offsets
+        )  # (human_batch, human_height * human_width, 2)
+        assert vertex_uvs_per_scene.shape == (human_batch, human_height * human_width, 2)
+
+        # To align with the OpenGL convention
+        vertex_uvs_per_scene[..., 0] /= human_batch  # x
+        vertex_uvs_per_scene[..., 1] = 1 - vertex_uvs_per_scene[..., 1]  # y
+
+        humans_lined = torch.cat(
+            [*human_alpha_ch_last], dim=1
+        )  # (human_height, human_batch * human_width, 4)
+        texture_per_scene = TexturesUV(
+            maps=humans_lined.reshape(1, human_height, human_batch * human_width, 4).expand(
+                bkg_batch, -1, -1, -1
+            ),
+            faces_uvs=faces_per_scene.reshape(1, -1, 3).expand(bkg_batch, -1, -1),
+            verts_uvs=vertex_uvs_per_scene.reshape(
+                1, human_batch * human_height * human_width, 2
+            ).expand(bkg_batch, -1, -1),
+        )
+
+        faces = faces_per_scene.unsqueeze(0).repeat(bkg_batch, 1, 1, 1).reshape(bkg_batch, -1, 3)
+        verts = human_points.reshape(bkg_batch, human_batch * human_height * human_width, 3)
+
+        return Meshes(verts=verts, faces=faces, textures=texture_per_scene)
+
     def render_human_mesh(
+        self,
         human_mesh: Meshes,
         intrinsics: Float[torch.Tensor, "b 3 3"],
         render_height: int,
@@ -648,7 +684,7 @@ class HumanComposer3D(nn.Module):
         raster_settings = RasterizationSettings(
             image_size=(render_height, render_width),
             blur_radius=1e-12,
-            faces_per_pixel=1,
+            faces_per_pixel=self.max_human_num,
             bin_size=None,
             cull_backfaces=False,  # This will ignore back-facing polygons
             perspective_correct=True,
@@ -656,7 +692,7 @@ class HumanComposer3D(nn.Module):
 
         renderer = MeshRendererWithDepth(
             rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
-            shader=SimpleShaderWithMask(
+            shader=AlphaCompositionShader(
                 device=device, blend_params=BlendParams(background_color=(0, 0, 0))
             ),
         )
@@ -708,45 +744,63 @@ class HumanComposer3D(nn.Module):
 
         # Step5. Fit a plane
         plane_coeff = []
+        invalid_plane_coeff = torch.tensor(
+            [1, 0, 0, torch.nan], dtype=img.dtype, device=img.device
+        )
         for b in range(batch):
             g_mask = ground_mask[b]
-            if torch.any(g_mask):
-                ground_points = moge_metric_points[b][g_mask]
+            ground_points = moge_metric_points[b][g_mask]  # (n, 3)
+            if ground_points.shape[0] == 0:
+                plane_coeff.append(invalid_plane_coeff)
+                if self.verbose:
+                    print(f"batch{b}: ground not detected")
+                continue
 
-                # Skip RANSAC for now. Maybe necessary in the future???
-                # https://stackoverflow.com/questions/38754668/plane-fitting-in-a-3d-point-cloud
-                # https://scipy.github.io/old-wiki/pages/Cookbook/RANSAC
-                pa, pb, pc, pd = best_fitting_plane(ground_points.unsqueeze(0), equation=True)
+            # Skip RANSAC for now. Maybe necessary in the future???
+            # https://stackoverflow.com/questions/38754668/plane-fitting-in-a-3d-point-cloud
+            # https://scipy.github.io/old-wiki/pages/Cookbook/RANSAC
+            pa, pb, pc, pd = best_fitting_plane(ground_points.unsqueeze(0), equation=True)
+            g_normal = F.normalize(
+                torch.tensor([pa, pb, pc], dtype=pa.dtype, device=pa.device), dim=0
+            )
+
+            # sanity check with GeoCalib
+            calib_result = self.geocalib.calibrate(img[b])
+            gravity_vec = calib_result["gravity"].vec3d  # already L2 normalized
+            cos_sim = torch.sum(g_normal * gravity_vec)
+            if torch.abs(cos_sim) > 0.9:
                 plane_coeff.append(torch.cat([pa, pb, pc, pd], dim=-1))
             else:
-                plane_coeff.append(
-                    torch.tensor([1, 0, 0, torch.nan], dtype=img.dtype, device=img.device)
-                )
+                plane_coeff.append(invalid_plane_coeff)
+
+            if self.verbose:
+                print(f"batch{b}: {cos_sim=}")
+
         plane_coeff = torch.stack(plane_coeff, dim=0)
 
-        # Step6. Generate a human
-        human = self.generate_human(batch=img.shape[0], device=img.device)
-        human_mask = self.segment_human(human)
+        # Step6. Generate humans
+        humans = self.generate_human(device=img.device)
+        humans_mask = self.segment_human(humans)
 
-        # Step7. Place the human in the scene
-        human_mesh = self.place_a_human_in_the_scene(
-            human, human_mask, moge_metric_depth, plane_coeff, cam_focal_len, return_mesh=True
+        # Step7. Place the humans in the scene
+        humans_mesh = self.place_humans_in_the_scene(
+            humans, humans_mask, moge_metric_depth, plane_coeff, cam_focal_len, return_mesh=True
         )
 
-        # Step8. Render the human
-        human_rendered, human_rendered_depth = self.render_human_mesh(
-            human_mesh,
+        # Step8. Render the humans
+        humans_rendered, humans_rendered_depth = self.render_human_mesh(
+            humans_mesh,
             intrinsics,
             height,
             width,
         )
 
-        # Step9. Compose the human and the scene
+        # Step9. Compose the humans and the scene
         img_ch_last = img.permute(0, 2, 3, 1)
-        ret_mask = human_rendered[..., 3:4]
-        ret = (1 - ret_mask) * img_ch_last + ret_mask * human_rendered[..., :3]
+        ret_mask = humans_rendered[..., 3:4]
+        ret = (1 - ret_mask) * img_ch_last + ret_mask * humans_rendered[..., :3]
 
-        bg_forefront_mask = (moge_metric_depth < human_rendered_depth).unsqueeze(-1)
+        bg_forefront_mask = (moge_metric_depth < humans_rendered_depth).unsqueeze(-1)
         ret = torch.where(bg_forefront_mask, img_ch_last, ret)
         ret_mask[bg_forefront_mask] = 0
 
