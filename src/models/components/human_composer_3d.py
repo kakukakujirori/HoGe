@@ -11,6 +11,7 @@ from pytorch3d.renderer import (
     TexturesUV,
 )
 from pytorch3d.renderer.blending import BlendParams, hard_rgb_blend
+from pytorch3d.renderer.mesh.rasterizer import Fragments
 from pytorch3d.structures import Meshes
 from pytorch3d.transforms import axis_angle_to_matrix
 from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
@@ -142,28 +143,76 @@ def best_fitting_plane(points, equation: bool = False):
 # >>> Human Renderer Classes >>>
 
 
-class SimpleShaderWithMask(torch.nn.Module):
-    def __init__(self, device="cpu", blend_params=None):
-        super().__init__()
-        self.blend_params = blend_params if blend_params is not None else BlendParams()
-
-    def forward(self, fragments, meshes, **kwargs) -> torch.Tensor:
-        blend_params = kwargs.get("blend_params", self.blend_params)
-        texels = meshes.sample_textures(fragments)  # [N, H, W, K, 4]
-        return texels[..., 0, :], fragments.zbuf[..., 0]  # (N, H, W, 4) RGBA image
-
-
 class AlphaCompositionShader(torch.nn.Module):
     def __init__(self, device="cpu", blend_params=None):
         super().__init__()
         self.blend_params = blend_params if blend_params is not None else BlendParams()
 
-    def forward(self, fragments, meshes, **kwargs):
-        # Get pixel colors and alphas from the texture
-        pixel_colors = meshes.sample_textures(fragments)  # [N, H, W, K, 4]
+    def raster_each_labeled_human(self, fragments: Fragments, meshes: Meshes):
+        pixel_colors, pixel_labels = torch.split(
+            meshes.sample_textures(fragments),  # [B, H, W, K, 5]
+            [4, 1],
+            dim=-1,
+        )
+        pixel_labels = pixel_labels.squeeze(-1).round().long()  # (B, H, W, K)
+        pixel_labels[fragments.zbuf < 0] = -1  # invalid label
+        B, H, W, K, C = pixel_colors.shape
+        N = K  # N = (label range: [0, 1, ..., N-1]), here we assume the layer_num K equals to the label_num N
 
-        # Extract alpha values
-        alphas = pixel_colors[..., 3]
+        # the label range is [0, 1, ..., N-1]
+        human_images = torch.zeros(
+            B, H, W, N, C, dtype=pixel_colors.dtype, device=pixel_colors.device
+        )  # (B, H, W, N, C)
+
+        # Create a range tensor for each batch, height, width
+        batch_range = torch.arange(B)
+        height_range = torch.arange(H)
+        width_range = torch.arange(W)
+        label_range = torch.arange(N, dtype=pixel_labels.dtype, device=pixel_labels.device)
+
+        # Find the first index for each unique value (shape=(B, H, W, N), values=[0, 1, ..., K-1])
+        label_hit = torch.ones(B, H, W, K + 1, N, dtype=torch.bool, device=pixel_labels.device)
+        label_hit[:, :, :, :K, :] = pixel_labels.reshape(B, H, W, K, 1) == label_range.reshape(
+            1, 1, 1, 1, N
+        )
+        first_indices = torch.argmax(label_hit.int(), dim=3)
+
+        # Create batch indices
+        batch_indices = batch_range.reshape(B, 1, 1, 1).expand_as(first_indices)
+        height_indices = height_range.reshape(1, H, 1, 1).expand_as(first_indices)
+        width_indices = width_range.reshape(1, 1, W, 1).expand_as(first_indices)
+
+        # gather values from first_indices
+        pixel_colors_with_void = torch.zeros(
+            B, H, W, K + 1, C, dtype=pixel_colors.dtype, device=pixel_colors.device
+        )
+        pixel_colors_with_void[:, :, :, :K, :] = pixel_colors
+        gathered_values = pixel_colors_with_void[
+            batch_indices, height_indices, width_indices, first_indices
+        ]
+        human_images[
+            batch_indices, height_indices, width_indices, label_range.reshape(1, 1, 1, N)
+        ] = gathered_values
+
+        # fill the background
+        human_color, human_alpha = torch.split(human_images, [3, 1], dim=-1)
+        bkg_color = torch.tensor(
+            self.blend_params.background_color, dtype=human_color.dtype, device=human_color.device
+        )
+        human_images[..., :3] = human_color * human_alpha + bkg_color * (1 - human_alpha)
+
+        return human_images
+
+    def forward(self, fragments: Fragments, meshes: Meshes, **kwargs):
+        # Get pixel colors and alphas from the texture
+        pixel_colors, pixel_labels = torch.split(
+            meshes.sample_textures(fragments),  # [B, H, W, K, 5]
+            [4, 1],
+            dim=-1,
+        )
+        B, H, W, K, _ = pixel_colors.shape
+        pixel_labels.squeeze_(-1)
+        pixel_labels[fragments.zbuf < 0] = torch.nan  # invalid label
 
         # Perform alpha compositing
         # This is a basic over-compositing approach
@@ -172,40 +221,42 @@ class AlphaCompositionShader(torch.nn.Module):
         composite_image[..., 0] = self.blend_params.background_color[0]
         composite_image[..., 1] = self.blend_params.background_color[1]
         composite_image[..., 2] = self.blend_params.background_color[2]
-
-        composite_depth = torch.where(
-            fragments.zbuf[..., -1] > 0,
-            fragments.zbuf[..., -1],
-            fragments.zbuf[..., -1].flatten(1).max(dim=1).values.reshape(-1, 1, 1),
-        )
+        composite_depth = torch.full_like(
+            fragments.zbuf[..., -1], 100
+        )  # set the farthest distance to 100[m]
+        composite_label = torch.full_like(pixel_labels[..., -1], K)  # (B, H, W)
 
         # Iterate through the K samples (typically from rasterization)
-        for k in range(pixel_colors.shape[3] - 1, -1, -1):
+        for k in range(K - 1, -1, -1):
             # Current layer's color and alpha
             layer_color = pixel_colors[..., k, :3]
-            layer_alpha = alphas[..., k]
+            layer_alpha = pixel_colors[..., k, 3]
             layer_depth = fragments.zbuf[..., k]
+            layer_label = pixel_labels[..., k]
+            layer_depth_valid = layer_depth > 0
+            layer_label_valid = torch.isfinite(layer_label)
 
             # Blend with previous composite
             composite_image[..., :3] = layer_color * layer_alpha[..., None] + composite_image[
                 ..., :3
             ] * (1 - layer_alpha[..., None])
             composite_image[..., 3] = torch.maximum(layer_alpha, composite_image[..., 3])
-            composite_depth = layer_depth * layer_alpha + composite_depth * (1 - layer_alpha)
+            composite_depth[layer_depth_valid] = (
+                layer_depth * layer_alpha + composite_depth * (1 - layer_alpha)
+            )[layer_depth_valid]
+            composite_label[layer_label_valid] = torch.where(
+                layer_alpha > 0.5,
+                layer_label,
+                composite_label,
+            )[layer_label_valid]
 
-        return composite_image, composite_depth
+        # render each human RGBA
+        human_images = self.raster_each_labeled_human(fragments, meshes)
 
+        # set invalid label to -1
+        composite_label[composite_label > K - 0.5] = -1
 
-class MeshRendererWithDepth(torch.nn.Module):
-    def __init__(self, rasterizer, shader):
-        super().__init__()
-        self.rasterizer = rasterizer
-        self.shader = shader
-
-    def forward(self, meshes_world, **kwargs) -> torch.Tensor:
-        fragments = self.rasterizer(meshes_world, **kwargs)
-        images, depths = self.shader(fragments, meshes_world, **kwargs)
-        return images, depths
+        return composite_image, composite_depth, composite_label.round().long(), human_images
 
 
 # <<< Human Renderer Classes <<<
@@ -522,7 +573,16 @@ class HumanComposer3D(nn.Module):
         bkg_batch, bkg_height, bkg_width = bkg_metric_depth.shape
         human_batch, _, human_height, human_width = humans.shape
 
-        human_alpha_ch_last = torch.cat([humans, humans_mask], dim=1).permute(0, 2, 3, 1)
+        human_alpha_label_ch_last = torch.cat(
+            [
+                humans,
+                humans_mask,
+                torch.arange(human_batch, dtype=humans.dtype, device=humans.device)
+                .reshape(-1, 1, 1, 1)
+                .expand_as(humans_mask),
+            ],
+            dim=1,
+        ).permute(0, 2, 3, 1)
 
         PA, PB, PC, PD = torch.split(plane_coeff, 1, dim=1)
         assert PA.shape == (bkg_batch, 1), f"{PA.shape=}"
@@ -638,10 +698,10 @@ class HumanComposer3D(nn.Module):
         vertex_uvs_per_scene[..., 1] = 1 - vertex_uvs_per_scene[..., 1]  # y
 
         humans_lined = torch.cat(
-            [*human_alpha_ch_last], dim=1
-        )  # (human_height, human_batch * human_width, 4)
+            [*human_alpha_label_ch_last], dim=1
+        )  # (human_height, human_batch * human_width, 5)
         texture_per_scene = TexturesUV(
-            maps=humans_lined.reshape(1, human_height, human_batch * human_width, 4).expand(
+            maps=humans_lined.reshape(1, human_height, human_batch * human_width, 5).expand(
                 bkg_batch, -1, -1, -1
             ),
             faces_uvs=faces_per_scene.reshape(1, -1, 3).expand(bkg_batch, -1, -1),
@@ -661,7 +721,8 @@ class HumanComposer3D(nn.Module):
         intrinsics: Float[torch.Tensor, "b 3 3"],
         render_height: int,
         render_width: int,
-    ) -> tuple[Float[torch.Tensor, "b h w 4"], Float[torch.Tensor, "b h w"]]:
+        background_color: tuple[float, float, float] = (0, 0, 0),
+    ):
         batch = intrinsics.shape[0]
         device = intrinsics.device
 
@@ -690,16 +751,75 @@ class HumanComposer3D(nn.Module):
             perspective_correct=True,
         )
 
-        renderer = MeshRendererWithDepth(
-            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
-            shader=AlphaCompositionShader(
-                device=device, blend_params=BlendParams(background_color=(0, 0, 0))
-            ),
+        rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings)
+        blend_params = BlendParams(background_color=background_color)
+        shader = AlphaCompositionShader(blend_params)
+
+        fragments = rasterizer(human_mesh)
+        human_rendered, human_rendered_depth, human_rendered_label, human_images = shader(
+            fragments, human_mesh
         )
 
-        human_rendered, human_rendered_depth = renderer(human_mesh)
+        return human_rendered, human_rendered_depth, human_rendered_label, human_images
 
-        return human_rendered, human_rendered_depth
+    def compose_humans_and_the_scene(
+        self,
+        humans_rendered: Float[torch.Tensor, "b h w 4"],
+        humans_rendered_depth: Float[torch.Tensor, "b h w"],
+        humans_rendered_label: Float[torch.Tensor, "b h w"],
+        background: Float[torch.Tensor, "b 3 h w"],
+        background_depth: Float[torch.Tensor, "b h w"],
+    ):
+        batch, channel, height, width = background.shape
+        assert channel == 3
+        assert humans_rendered.shape == (batch, height, width, 4), f"{humans_rendered.shape=}"
+        assert humans_rendered_depth.shape == (
+            batch,
+            height,
+            width,
+        ), f"{humans_rendered_depth.shape=}"
+        assert humans_rendered_label.shape == (
+            batch,
+            height,
+            width,
+        ), f"{humans_rendered_label.shape=}"
+        assert background_depth.shape == (batch, height, width), f"{background_depth.shape=}"
+
+        img_ch_last = background.permute(0, 2, 3, 1)
+        ret_mask = humans_rendered[..., 3:4].clone()
+        ret = (1 - ret_mask) * img_ch_last + ret_mask * humans_rendered[..., :3]
+
+        bg_forefront_mask = (background_depth < humans_rendered_depth).unsqueeze(-1)
+        ret = torch.where(bg_forefront_mask, img_ch_last, ret)
+        ret_mask[bg_forefront_mask] = 0
+        ret_label = torch.where(bg_forefront_mask.squeeze(-1), -1, humans_rendered_label)
+
+        return torch.cat([ret, ret_mask], dim=-1), ret_label
+
+    def detect_erroneous_humans(
+        self,
+        humans_label: Float[torch.Tensor, "b h w"],
+        human_images: Float[torch.Tensor, "b h w n 4"],
+    ):
+        batch, height, width, num, channel = human_images.shape
+        assert channel == 4
+        assert humans_label.shape == (batch, height, width)
+
+        # count visible pixels
+        batch, height, width, num, channel = human_images.shape
+        humans_label = torch.where(humans_label < 0, num, humans_label)
+        onehot = F.one_hot(humans_label.long(), num_classes=num + 1)
+        modal_bincount = torch.sum(onehot.reshape(batch, -1, num + 1), dim=1)[:, :num]
+
+        # count total human pixels
+        # amodal_area = human_images[..., 3] + ?????????????????????????????????????????????????????????????????????????????????????????
+        amodal_bincount = (human_images[..., 3].reshape(batch, -1, num) > 0.5).long().sum(dim=1)
+
+        # humans that are (1) less than 5% visible, or (2) less than xxx% of the image pixels, are marked invalid following WALT
+        visible_ratio = modal_bincount / (1 + amodal_bincount)
+        invalid_human = (visible_ratio < 0.05) + (modal_bincount < height * width * 0.001)
+
+        return invalid_human
 
     def harmonize(
         self, composed: Float[torch.Tensor, "b 3 h w"], mask: Float[torch.Tensor, "b 1 h w"]
@@ -788,25 +908,41 @@ class HumanComposer3D(nn.Module):
         )
 
         # Step8. Render the humans
-        humans_rendered, humans_rendered_depth = self.render_human_mesh(
-            humans_mesh,
-            intrinsics,
-            height,
-            width,
+        humans_rendered, humans_rendered_depth, humans_rendered_label, human_images = (
+            self.render_human_mesh(
+                humans_mesh,
+                intrinsics,
+                height,
+                width,
+            )
         )
 
         # Step9. Compose the humans and the scene
-        img_ch_last = img.permute(0, 2, 3, 1)
-        ret_mask = humans_rendered[..., 3:4]
-        ret = (1 - ret_mask) * img_ch_last + ret_mask * humans_rendered[..., :3]
+        composed_rgba, composed_label = self.compose_humans_and_the_scene(
+            humans_rendered,
+            humans_rendered_depth,
+            humans_rendered_label,
+            img,
+            moge_metric_depth,
+        )
 
-        bg_forefront_mask = (moge_metric_depth < humans_rendered_depth).unsqueeze(-1)
-        ret = torch.where(bg_forefront_mask, img_ch_last, ret)
-        ret_mask[bg_forefront_mask] = 0
+        # # It's enough to treat invalid humans during model training, so we skip this invalid_human detection
+        # invalid_humans = self.detect_erroneous_humans(
+        #     composed_label,
+        #     human_images,
+        # )  # (B, self.max_human_num)
 
-        # Step10. Harmonize (NOTE: back to channel first)
-        ret = ret.permute(0, 3, 1, 2)
-        ret_mask = ret_mask.reshape(batch, 1, height, width)
-        ret = self.harmonize(ret, ret_mask)
+        # Step10. Harmonize "for each person"
+        humans_rgb, humans_alpha = torch.split(human_images.permute(0, 4, 1, 2, 3), [3, 1], dim=1)
+        for n in range(human_images.shape[-2]):
+            person_rgb, person_alpha = humans_rgb[..., n], humans_alpha[..., n]
+            composed_tmp = (1 - person_alpha) * img + person_alpha * person_rgb
+            with torch.inference_mode():
+                harmonized_tmp = self.harmonize(composed_tmp, person_alpha)
+                person_harmonized = (1 - person_alpha) * person_rgb + person_alpha * harmonized_tmp
+                human_images[:, :, :, n, :3] = person_harmonized.permute(0, 2, 3, 1)
+                composed_rgba[composed_label == n] = human_images[:, :, :, n, :][
+                    composed_label == n
+                ]
 
-        return ret, ret_mask
+        return composed_rgba, composed_label, human_images
