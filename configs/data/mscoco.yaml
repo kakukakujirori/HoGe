@@ -4,6 +4,7 @@ val_data_dir: /media/ryotaro/ssd1/coco/val2017
 test_data_dir: null
 width: 512
 height: 512
+include_alpha_channel: false
 augmentation_list:
   - _target_: albumentations.ColorJitter
     brightness: [0.8, 1.2]

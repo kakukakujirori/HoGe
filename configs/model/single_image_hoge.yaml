@@ -1,4 +1,4 @@
-_target_: src.models.hoge_module.HoGeModule
+_target_: src.models.single_image_hoge_module.SingleImageHoGeModule
 
 optimizer:
   _target_: torch.optim.AdamW

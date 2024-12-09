@@ -83,7 +83,10 @@ def PCA(data, correlation: bool = False, sort: bool = True):
         matrix = batch_cov(data_adjusted)
 
     # Compute eigenvalues and eigenvectors for each batch matrix
-    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    except torch._C._LinAlgError as e:
+        raise HumanCompositionError(f"[PCA] {e}")
 
     # Sort if required (in descending order)
     if sort:
@@ -266,11 +269,13 @@ class HumanComposer3D(nn.Module):
     def __init__(
         self,
         max_human_num: int = 5,
+        human_distance: tuple[int, int] = (1, 10),
         verbose: bool = False,
     ):
         super().__init__()
         assert max_human_num > 0
         self.max_human_num = max_human_num
+        self.human_distance = human_distance
         self.verbose = verbose
 
         # StyleGAN-Human
@@ -430,9 +435,20 @@ class HumanComposer3D(nn.Module):
         )
         human_resized = (human_resized - mean) / std
 
+        # error if segmask is empty
+        if not torch.any(segmask_resized > 0.5) or not torch.isfinite(segmask_resized).all():
+            raise HumanCompositionError(
+                f"Erroneous segmask: {(segmask_resized > 0.5).flatten(1).sum(dim=-1)=}"
+            )
+
         # matting
         batch = {"image": human_resized.unsqueeze(1), "mask": segmask_resized.unsqueeze(1)}
-        output = self.matting_model(batch)
+        try:
+            output = self.matting_model(batch)
+        except ValueError as e:
+            print(e)
+            print(f"{(segmask_resized > 0.5).flatten(1).sum(dim=-1)=}")
+            raise HumanCompositionError(e)
 
         # Postprocess alpha matte
         alpha = output["refined_masks"].squeeze(1)
@@ -595,9 +611,9 @@ class HumanComposer3D(nn.Module):
         humans_actual_height = torch.normal(
             1.7, 0.07, (human_batch,), dtype=humans.dtype, device=humans.device
         )
-        humans_min_depth = 1.0
+        humans_min_depth = self.human_distance[0]
         humans_max_depth = torch.max(bkg_metric_depth.reshape(bkg_batch, -1), dim=1).values.clamp(
-            humans_min_depth, 5.0
+            humans_min_depth, self.human_distance[1]
         )  # (bkg_batch,)
         humans_depth = humans_min_depth + torch.rand(
             (bkg_batch, human_batch), dtype=humans.dtype, device=humans.device
@@ -840,11 +856,12 @@ class HumanComposer3D(nn.Module):
         output = self.moge.infer(img)
         points = output["points"]  # (B, H, W, 3)
         depth = output["depth"]  # (B, H, W)
-        mask = output["mask"]  # (B, H, W)
+        # mask = output["mask"]  # (B, H, W)
         intrinsics = output["intrinsics"].clone()  # (B, 3, 3)
         intrinsics[:, 0, :] *= width
         intrinsics[:, 1, :] *= height
         cam_focal_len = (intrinsics[:, 0, 0] + intrinsics[:, 1, 1]) / 2
+        del output
 
         # Step2. Metric3D (MoGe focal_len is better in HyperSim scenes)
         metric3dv2_depth, _ = self.get_metric_depth(
@@ -858,7 +875,7 @@ class HumanComposer3D(nn.Module):
         )
         moge_metric_depth = depth * scale.reshape(batch, 1, 1)
         moge_metric_points = points * scale.reshape(batch, 1, 1, 1)
-
+        del depth, points, scale
         # Step4. Ground mask
         ground_mask = self.segment_ground(img).squeeze(1) > 0  # (batch, height, width)
 
@@ -897,6 +914,7 @@ class HumanComposer3D(nn.Module):
                 print(f"batch{b}: {cos_sim=}")
 
         plane_coeff = torch.stack(plane_coeff, dim=0)
+        del ground_mask, g_mask, ground_points, moge_metric_points
 
         # Step6. Generate humans
         humans = self.generate_human(device=img.device)
@@ -906,6 +924,7 @@ class HumanComposer3D(nn.Module):
         humans_mesh = self.place_humans_in_the_scene(
             humans, humans_mask, moge_metric_depth, plane_coeff, cam_focal_len, return_mesh=True
         )
+        del humans, humans_mask, plane_coeff, cam_focal_len
 
         # Step8. Render the humans
         humans_rendered, humans_rendered_depth, humans_rendered_label, human_images = (
@@ -916,7 +935,7 @@ class HumanComposer3D(nn.Module):
                 width,
             )
         )
-
+        del humans_mesh, intrinsics
         # Step9. Compose the humans and the scene
         composed_rgba, composed_label = self.compose_humans_and_the_scene(
             humans_rendered,
@@ -925,6 +944,7 @@ class HumanComposer3D(nn.Module):
             img,
             moge_metric_depth,
         )
+        del humans_rendered, humans_rendered_depth, humans_rendered_label, moge_metric_depth
 
         # # It's enough to treat invalid humans during model training, so we skip this invalid_human detection
         # invalid_humans = self.detect_erroneous_humans(

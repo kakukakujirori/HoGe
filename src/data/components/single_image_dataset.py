@@ -13,10 +13,14 @@ class SingleImageDataset(Dataset):
     def __init__(
         self,
         image_dir: str,
-        max_size: int = 1024,
+        height: int = 512,
+        width: int = 512,
+        include_alpha_channel: bool = False,
         augmentation_list: list = [],
     ) -> None:
-        self.max_size = max_size
+        self.height = height
+        self.width = width
+        self.include_alpha_channel = include_alpha_channel
         self.aug = A.Compose(augmentation_list)
         self.image_paths = []
         self.image_paths += glob.glob(os.path.join(image_dir, "*.jpg"))
@@ -26,13 +30,11 @@ class SingleImageDataset(Dataset):
     def __getitem__(self, index: int) -> Float[torch.Tensor, "c h w"]:
         # load an image
         img_p = self.image_paths[index]
-        img = Image.open(img_p).convert("RGB")
-        if max(img.size) > self.max_size:
-            width, height = img.size
-            if width > height:
-                img = img.resize((self.max_size, height * self.max_size // width))
-            else:
-                img = img.resize((width * self.max_size // height, height))
+        if self.include_alpha_channel:
+            img = Image.open(img_p).convert("RGBA")
+        else:
+            img = Image.open(img_p).convert("RGB")
+        img = img.resize((self.width, self.height))
 
         # augmentations
         img = np.array(img)

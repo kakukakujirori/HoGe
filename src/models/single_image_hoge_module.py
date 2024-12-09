@@ -17,7 +17,7 @@ from src.models.components.render_mesh import RenderMesh
 from src.models.losses.optimal_alignment_loss import OptimalAlignmentLoss
 
 
-class HoGeModule(LightningModule):
+class SingleImageHoGeModule(LightningModule):
     """A `LightningModule` implements 8 key methods:
 
     ```python
@@ -59,7 +59,7 @@ class HoGeModule(LightningModule):
         log_images_every_n_steps: int = -1,
         compile: bool = True,
     ) -> None:
-        """Initialize a `HoGeModule`.
+        """Initialize a `SingleImageHoGeModule`.
 
         :param net: The model to train.
         :param optimizer: The optimizer to use for training.
@@ -109,7 +109,7 @@ class HoGeModule(LightningModule):
         pass
 
     @torch.inference_mode()
-    def generate_pseudo_gt(
+    def generate_pseudo_gt_by_camera_movement(
         self,
         image: Float[torch.Tensor, "b h w 3"],
     ) -> tuple[
@@ -126,7 +126,7 @@ class HoGeModule(LightningModule):
         batch, height, width, channel = image.shape
         assert channel == 3, f"{image.shape=}"
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
             intrinsics, meshes, points_original = self.mesh_generator(
                 image
             )  # (b, 3, 3), Meshes, (b, h, w, 3)
@@ -138,7 +138,6 @@ class HoGeModule(LightningModule):
                 meshes, camera
             )  # (b, h, w, layers, 4), (b, h, w, layers)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # unproject depths_rendered to points_rendered
             uv_coord = utils3d.torch.image_uv(
                 width=width, height=height, dtype=image.dtype, device=image.device
@@ -155,7 +154,6 @@ class HoGeModule(LightningModule):
                 batch, height, width, -1, 1
             )  # (b, h, w, 1, 3) * (b, h, w, layers, 1) => (b, h, w, layers, 3)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float32):
             # inpaint invalid region
             if self.hparams.inpaint_invalid_input_area:
                 img_rendered, mask_rendered = (
@@ -168,6 +166,10 @@ class HoGeModule(LightningModule):
                     [img_inpainted, mask_rendered], dim=1
                 ).permute(0, 2, 3, 1)
 
+        # assert torch.all(torch.isfinite(texels_rendered)), f"{texels_rendered=}"
+        # assert torch.all(torch.isfinite(points_rendered)), f"{points_rendered=}"
+        # assert torch.all(torch.isfinite(points_original)), f"{points_original=}"
+
         return texels_rendered, points_rendered, points_original
 
     def model_step(self, image_original: Float[torch.Tensor, "b h w c"]):
@@ -176,7 +178,9 @@ class HoGeModule(LightningModule):
         assert channel == 3
 
         # generate pseudo GT and inputs
-        texels_rendered, points_rendered, points_original = self.generate_pseudo_gt(image_original)
+        texels_rendered, points_rendered, points_original = (
+            self.generate_pseudo_gt_by_camera_movement(image_original)
+        )
 
         if self.hparams.gather_layers_before_inference:
             points_rendered, texels_rendered = OptimalAlignmentLoss.gather_valid_points(
@@ -184,6 +188,8 @@ class HoGeModule(LightningModule):
                 texels_rendered,
                 mask_thresh=0.5,  # NOTE: sky region is 'valid' here
             )
+            # assert torch.all(torch.isfinite(texels_rendered)), f"{texels_rendered=}"
+            # assert torch.all(torch.isfinite(points_rendered)), f"{points_rendered=}"
 
         input_dict = {
             "image_original": image_original,
@@ -206,6 +212,9 @@ class HoGeModule(LightningModule):
             invalid_mask=rearrange(invalid_mask_rendered, "b h w -> b () h w"),
         )
 
+        # for key, val in output_dict.items():
+        #     assert torch.all(torch.isfinite(val)), f"{key}: {val}"
+
         # calculate losses
         loss_dict = {}
         for loss_func in self.criterion_list:
@@ -213,8 +222,10 @@ class HoGeModule(LightningModule):
             loss_val = loss_func(input_dict, output_dict)
             if isinstance(loss_val, dict):
                 for key, val in loss_val.items():
+                    # assert torch.isfinite(val), f"{loss_key}[{key}]: {val}"
                     loss_dict[f"{loss_key}[{key}]"] = val
             else:
+                # assert torch.isfinite(loss_val), f"{loss_key}: {loss_val}"
                 loss_dict[loss_key] = loss_val
         loss_dict["total_loss"] = sum(loss_dict.values())
 
@@ -426,4 +437,4 @@ class HoGeModule(LightningModule):
 
 
 if __name__ == "__main__":
-    _ = HoGeModule(None, None, None, None)
+    _ = SingleImageHoGeModule(None, None, None, None)

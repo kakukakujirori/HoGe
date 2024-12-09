@@ -56,6 +56,7 @@ class SingleImageDataModule(LightningDataModule):
         test_data_dir: str,
         height: int = 512,
         width: int = 512,
+        include_alpha_channel: bool = False,
         augmentation_list: list = [],
         batch_size: int = 64,
         num_workers: int = 0,
@@ -79,8 +80,6 @@ class SingleImageDataModule(LightningDataModule):
         self.data_test: Optional[Dataset] = None
 
         self.batch_size_per_device = batch_size
-
-        self.dynamic_collate_unimplemented_warning_flag = False
 
     def prepare_data(self) -> None:
         """Download data if needed. Lightning ensures that `self.prepare_data()` is called only
@@ -114,35 +113,25 @@ class SingleImageDataModule(LightningDataModule):
         if stage == "fit" and not (self.data_train and self.data_val):
             self.data_train = SingleImageDataset(
                 image_dir=self.hparams.train_data_dir,
+                height=self.hparams.height,
+                width=self.hparams.width,
+                include_alpha_channel=self.hparams.include_alpha_channel,
                 augmentation_list=self.hparams.augmentation_list,
             )
             self.data_val = SingleImageDataset(
                 image_dir=self.hparams.val_data_dir,
+                height=self.hparams.height,
+                width=self.hparams.width,
+                include_alpha_channel=self.hparams.include_alpha_channel,
             )
 
         if stage == "test" and not self.data_test:
             self.data_test = SingleImageDataset(
                 image_dir=self.hparams.test_data_dir,
+                height=self.hparams.height,
+                width=self.hparams.width,
+                include_alpha_channel=self.hparams.include_alpha_channel,
             )
-
-    def dynamic_batch_collate(self, batch: list[torch.Tensor]):
-        # As MoGe does, change the resolution and the aspect ratio for each batch
-        if not self.dynamic_collate_unimplemented_warning_flag:
-            print("[SingleImageDataModule] WARNING: dynamic_batch_collate not yet implemented!!!")
-            self.dynamic_collate_unimplemented_warning_flag = True
-
-        batch = [
-            cv2.resize(img_t.numpy(), (self.hparams.width, self.hparams.height)) for img_t in batch
-        ]
-        batch = [torch.tensor(img) for img in batch]
-        return torch.utils.data.default_collate(batch)
-
-    def static_batch_collate(self, batch: list[torch.Tensor]):
-        batch = [
-            cv2.resize(img_t.numpy(), (self.hparams.width, self.hparams.height)) for img_t in batch
-        ]
-        batch = [torch.tensor(img) for img in batch]
-        return torch.utils.data.default_collate(batch)
 
     def train_dataloader(self) -> DataLoader[Any]:
         """Create and return the train dataloader.
@@ -155,7 +144,6 @@ class SingleImageDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=True,
-            collate_fn=self.dynamic_batch_collate,
         )
 
     def val_dataloader(self) -> DataLoader[Any]:
@@ -169,7 +157,6 @@ class SingleImageDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            collate_fn=self.static_batch_collate,
         )
 
     def test_dataloader(self) -> DataLoader[Any]:
@@ -183,7 +170,6 @@ class SingleImageDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
-            collate_fn=self.static_batch_collate,
         )
 
     def teardown(self, stage: Optional[str] = None) -> None:

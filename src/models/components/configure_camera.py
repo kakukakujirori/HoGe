@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from cuml.cluster.hdbscan import HDBSCAN
+
+# from cuml.cluster.hdbscan import HDBSCAN
+from hdbscan import HDBSCAN
 from jaxtyping import Float
 from pytorch3d.renderer import PerspectiveCameras
 from pytorch3d.structures import Meshes
@@ -53,15 +55,17 @@ class ConfigureCamera(torch.nn.Module):
             .permute(0, 2, 3, 1)
             .reshape(batch, -1, 3)
         )
-        point_cloud = (point_cloud - point_cloud.mean(axis=1, keepdims=True)) / point_cloud.std(
-            axis=1, keepdims=True
+        point_cloud = (point_cloud - point_cloud.mean(axis=1, keepdims=True)) / (
+            1e-3 + point_cloud.std(axis=1, keepdims=True)
         )
 
         w2c = torch.eye(4, device=points.device).unsqueeze(0).expand(batch, -1, -1).clone()
 
         for b in range(batch):
             pcd = point_cloud[b]
-            cluster_labels = torch.as_tensor(self.clusterer.fit_predict(pcd), device=points.device)
+            cluster_labels = torch.as_tensor(
+                self.clusterer.fit_predict(pcd.cpu().numpy()), device=points.device
+            )
 
             # target camera possible area
             dep_max = pcd[..., 2].max()
