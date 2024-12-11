@@ -1,3 +1,5 @@
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,7 +17,6 @@ from pytorch3d.renderer.mesh.rasterizer import Fragments
 from pytorch3d.structures import Meshes
 from pytorch3d.transforms import axis_angle_to_matrix
 from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
-from ultralytics import YOLO
 
 from src.models.components.moge_mesh import image_mesh
 from third_party.MaGGIe.maggie.network.arch import MaGGIe
@@ -259,6 +260,12 @@ class AlphaCompositionShader(torch.nn.Module):
         # set invalid label to -1
         composite_label[composite_label > K - 0.5] = -1
 
+        # refine the label
+        for k in range(K):
+            label_is_k = composite_label == k
+            label_cannot_be_k = human_images[:, :, :, k, 3] < 0.5
+            composite_label[label_is_k & label_cannot_be_k] = -1
+
         return composite_image, composite_depth, composite_label.round().long(), human_images
 
 
@@ -268,14 +275,25 @@ class AlphaCompositionShader(torch.nn.Module):
 class HumanComposer3D(nn.Module):
     def __init__(
         self,
-        max_human_num: int = 5,
-        human_distance: tuple[int, int] = (1, 10),
+        max_human_num_range: tuple[int, int] = (6, 48),
+        human_min_depth_range: tuple[int, int] = (0.5, 5),
+        human_max_depth_range: tuple[int, int] = (15, 20),
         verbose: bool = False,
     ):
         super().__init__()
-        assert max_human_num > 0
-        self.max_human_num = max_human_num
-        self.human_distance = human_distance
+        assert (
+            len(max_human_num_range) == 2 and 0 < max_human_num_range[0] < max_human_num_range[1]
+        )
+        assert (
+            len(human_min_depth_range) == 2 and human_min_depth_range[0] < human_min_depth_range[1]
+        )
+        assert (
+            len(human_max_depth_range) == 2 and human_max_depth_range[0] < human_max_depth_range[1]
+        )
+        assert human_min_depth_range[1] < human_max_depth_range[0]
+        self.max_human_num_range = max_human_num_range
+        self.human_min_depth_range = human_min_depth_range
+        self.human_max_depth_range = human_max_depth_range
         self.verbose = verbose
 
         # StyleGAN-Human
@@ -370,13 +388,15 @@ class HumanComposer3D(nn.Module):
         return ground_mask.float()
 
     def generate_human(
-        self, truncation_psi: float = 1.0, noise_mode: str = "const", device="cuda"
-    ) -> Float[torch.Tensor, "max_human_num 3 1024 512"]:
+        self,
+        batch_size: int,
+        truncation_psi: float = 1.0,
+        noise_mode: str = "const",
+        device: str = "cuda",
+    ) -> Float[torch.Tensor, "batch_size 3 1024 512"]:
         assert noise_mode in ["const", "random", "none"]
-        label = torch.zeros([self.max_human_num, self.stylegan_human.c_dim], device=device)
-        z = torch.randn(
-            self.max_human_num, self.stylegan_human.z_dim, dtype=torch.float32, device=device
-        )
+        label = torch.zeros([batch_size, self.stylegan_human.c_dim], device=device)
+        z = torch.randn(batch_size, self.stylegan_human.z_dim, dtype=torch.float32, device=device)
         w = self.stylegan_human.mapping(z, label, truncation_psi=truncation_psi)
         human = self.stylegan_human.synthesis(w, noise_mode=noise_mode, force_fp32=True)
         human = torch.clip((human + 1) / 2, 0, 1)  # (-1, 1) -> (0, 1)
@@ -603,6 +623,7 @@ class HumanComposer3D(nn.Module):
         PA, PB, PC, PD = torch.split(plane_coeff, 1, dim=1)
         assert PA.shape == (bkg_batch, 1), f"{PA.shape=}"
         ground_normal = plane_coeff[:, :3]
+        bkg_max_depth = torch.max(bkg_metric_depth.reshape(bkg_batch, -1), dim=1).values
 
         foot_pos_in_fg, current_human_pixel_height = (
             __class__.get_human_foot_pixel_coord_and_height(humans_mask, index="xy")
@@ -611,10 +632,13 @@ class HumanComposer3D(nn.Module):
         humans_actual_height = torch.normal(
             1.7, 0.07, (human_batch,), dtype=humans.dtype, device=humans.device
         )
-        humans_min_depth = self.human_distance[0]
-        humans_max_depth = torch.max(bkg_metric_depth.reshape(bkg_batch, -1), dim=1).values.clamp(
-            humans_min_depth, self.human_distance[1]
-        )  # (bkg_batch,)
+        humans_max_depth = torch.empty_like(bkg_max_depth).uniform_(
+            self.human_max_depth_range[0], self.human_max_depth_range[1]
+        )
+        humans_min_depth = self.human_min_depth_range[0] + torch.rand_like(bkg_max_depth) * (
+            bkg_max_depth.clamp(self.human_min_depth_range[0], self.human_min_depth_range[1])
+            - self.human_min_depth_range[0]
+        )
         humans_depth = humans_min_depth + torch.rand(
             (bkg_batch, human_batch), dtype=humans.dtype, device=humans.device
         ) * (humans_max_depth - humans_min_depth).reshape(
@@ -622,12 +646,15 @@ class HumanComposer3D(nn.Module):
         )  # (bkg_batch, human_batch)
         assert humans_depth.shape == (bkg_batch, human_batch)
         if self.verbose:
-            print(f"[place_humans_in_the_scene] {humans_actual_height=}\n{humans_depth=}")
+            print(f"[place_humans_in_the_scene] {humans_min_depth=}")
+            print(f"[place_humans_in_the_scene] {humans_max_depth=}")
+            print(f"[place_humans_in_the_scene] {humans_actual_height=}")
+            print(f"[place_humans_in_the_scene] {humans_depth=}")
 
         """Put humans on the intersection line of ax+by+cz+d=0 (plane_eq) and z=humans_depth.
         Note that nearly a=c=0 in most cases.
 
-        The intersection line is parametrized by (x, (d - c * humans_depth - ax) / b, humans_depth)
+        The intersection line is parametrized by (x, (-d - c * humans_depth - ax) / b, humans_depth)
         The free variable x is constrained by the camera FoV.
         """
         # foot position in 3D space
@@ -734,6 +761,7 @@ class HumanComposer3D(nn.Module):
     def render_human_mesh(
         self,
         human_mesh: Meshes,
+        human_num: int,
         intrinsics: Float[torch.Tensor, "b 3 3"],
         render_height: int,
         render_width: int,
@@ -761,7 +789,7 @@ class HumanComposer3D(nn.Module):
         raster_settings = RasterizationSettings(
             image_size=(render_height, render_width),
             blur_radius=1e-12,
-            faces_per_pixel=self.max_human_num,
+            faces_per_pixel=human_num,
             bin_size=None,
             cull_backfaces=False,  # This will ignore back-facing polygons
             perspective_correct=True,
@@ -876,6 +904,7 @@ class HumanComposer3D(nn.Module):
         moge_metric_depth = depth * scale.reshape(batch, 1, 1)
         moge_metric_points = points * scale.reshape(batch, 1, 1, 1)
         del depth, points, scale
+
         # Step4. Ground mask
         ground_mask = self.segment_ground(img).squeeze(1) > 0  # (batch, height, width)
 
@@ -917,8 +946,21 @@ class HumanComposer3D(nn.Module):
         del ground_mask, g_mask, ground_points, moge_metric_points
 
         # Step6. Generate humans
-        humans = self.generate_human(device=img.device)
-        humans_mask = self.segment_human(humans)
+        human_num = random.randint(self.max_human_num_range[0], self.max_human_num_range[1])
+        if self.verbose:
+            print(f"[generate_humans] {human_num=}")
+
+        HUMAN_GEN_BATCH = 8  # batch=8 fits in GPU memory
+        quotient, remainder = divmod(human_num, HUMAN_GEN_BATCH)
+        humans, humans_mask = [], []
+        for _ in range(quotient):
+            humans.append(self.generate_human(HUMAN_GEN_BATCH, device=img.device))
+            humans_mask.append(self.segment_human(humans[-1]))
+        if remainder > 0:
+            humans.append(self.generate_human(remainder, device=img.device))
+            humans_mask.append(self.segment_human(humans[-1]))
+        humans = torch.cat(humans, dim=0)
+        humans_mask = torch.cat(humans_mask, dim=0)
 
         # Step7. Place the humans in the scene
         humans_mesh = self.place_humans_in_the_scene(
@@ -930,12 +972,14 @@ class HumanComposer3D(nn.Module):
         humans_rendered, humans_rendered_depth, humans_rendered_label, human_images = (
             self.render_human_mesh(
                 humans_mesh,
+                human_num,
                 intrinsics,
                 height,
                 width,
             )
         )
         del humans_mesh, intrinsics
+
         # Step9. Compose the humans and the scene
         composed_rgba, composed_label = self.compose_humans_and_the_scene(
             humans_rendered,
