@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import utils3d
-from geocalib import GeoCalib
 from jaxtyping import Float
 from pytorch3d.renderer import (
     MeshRasterizer,
@@ -18,6 +17,7 @@ from pytorch3d.structures import Meshes
 from pytorch3d.transforms import axis_angle_to_matrix
 from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
 
+from geocalib import GeoCalib
 from src.models.components.moge_mesh import image_mesh
 from third_party.MaGGIe.maggie.network.arch import MaGGIe
 from third_party.MoGe.moge.model import MoGeModel

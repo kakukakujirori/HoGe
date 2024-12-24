@@ -3,13 +3,14 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from geocalib import GeoCalib
+from einops import rearrange
 from jaxtyping import Float
 from kornia.geometry.homography import find_homography_dlt
 from kornia.geometry.transform import warp_perspective
 from pytorch3d.transforms import axis_angle_to_matrix
 from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
 
+from geocalib import GeoCalib
 from third_party.MaGGIe.maggie.network.arch import MaGGIe
 from third_party.MoGe.moge.model import MoGeModel
 from third_party.PCTNet.iharm.inference.utils import load_model
@@ -187,6 +188,9 @@ class HumanComposer(nn.Module):
         # Harmonizer
         model_type = "ViT_pct"
         self.harmonizer = load_model(model_type, HARMONIZER_WEIGHT, verbose=False)
+
+        # start from eval mode
+        self.eval()
 
     def run_oneformer(self, img: Float[torch.Tensor, "b 3 h w"]) -> Float[torch.Tensor, "b 1 h w"]:
         b, c, h_ori, w_ori = img.shape
@@ -582,22 +586,79 @@ class HumanComposer(nn.Module):
             corner_pixels.reshape(human_batch, 4, 2),
             corner_points_projected_xy.reshape(bkg_batch * human_batch, 4, 2),
         )
+        humans_height_map = (
+            foot_pos_in_fg[:, 1].reshape(human_batch, 1)
+            - torch.linspace(0, human_height - 1, human_height, device=humans.device)
+            .reshape(1, -1)
+            .expand(human_batch, -1)
+        ) * scale_factor.reshape(human_batch, 1)
+        humans_height_map = humans_height_map.reshape(human_batch, 1, human_height, 1).expand(
+            -1, -1, -1, human_width
+        )  # NEW!!! FOR COLLISION DETECTION WITH THE BACKGROUND
         humans_image_mask_depth = torch.cat(
             [
                 humans[None].expand(bkg_batch, -1, -1, -1, -1),
                 humans_mask[None].expand(bkg_batch, -1, -1, -1, -1),
                 humans_plane_depth,
+                humans_height_map[None],
             ],
             dim=2,
         )
-        humans_image_mask_depth_warped = warp_perspective(
-            humans_image_mask_depth.reshape(bkg_batch * human_batch, 5, human_height, human_width),
-            homographies,
-            (bkg_height, bkg_width),
-        ).reshape(bkg_batch, human_batch, 5, bkg_height, bkg_width)
-        humans_image_mask_warped, humans_depth_warped = torch.split(
-            humans_image_mask_depth_warped, [4, 1], dim=2
+        try:
+            humans_image_mask_depth_warped = warp_perspective(
+                humans_image_mask_depth.reshape(
+                    bkg_batch * human_batch, 6, human_height, human_width
+                ),
+                homographies,
+                (bkg_height, bkg_width),
+            )
+            humans_image_mask_depth_warped = humans_image_mask_depth_warped.reshape(
+                bkg_batch, human_batch, 6, bkg_height, bkg_width
+            )
+        except torch._C._LinAlgError as e:
+            print(f"[place_human_in_the_scene] warp_perspective: {e}")
+            raise HumanCompositionError(e)
+        humans_image_mask_warped, humans_depth_warped, humans_height_warped = torch.split(
+            humans_image_mask_depth_warped, [4, 1, 1], dim=2
         )
+
+        # detect collision (colliding objects are moved to LARGEST_DEPTH)
+        def _judge_collision(
+            humans_image_mask,
+            humans_depth,
+            humans_height,
+            bkg_metric_depth,
+            ABOVE_GROUND_THRESH=0.3,
+            COLLISION_DIST_THRESH=0.001,
+            COLLISION_JUDGE_THRESH=10,  # NOTE: pixel num
+        ):
+
+            # Collision detection between humans and the scene (only the depth difference is fine to check)
+            humans_bkg_depth_diff = torch.abs(
+                humans_depth - rearrange(bkg_metric_depth, "b h w -> b () () h w")
+            )  # (bkg_batch, obj_batch, 1, h, w)
+            humans_mask_binary = humans_image_mask[:, :, 3:4, :, :] < 0.99
+            humans_bkg_depth_diff_mask = humans_mask_binary * (humans_height > ABOVE_GROUND_THRESH)
+            humans_bkg_depth_diff[humans_bkg_depth_diff_mask] = LARGEST_DEPTH
+            humans_bkg_depth_diff.nan_to_num_(LARGEST_DEPTH, LARGEST_DEPTH, LARGEST_DEPTH)
+
+            collision_area = torch.sum(
+                humans_bkg_depth_diff < COLLISION_DIST_THRESH, dim=[-1, -2]
+            ).reshape(bkg_batch, human_batch)
+            collision_judge = (
+                collision_area > COLLISION_JUDGE_THRESH
+            )  # * torch.sum(humans_mask_binary, dim=[-1, -2])
+            if self.verbose:
+                print(f"[_judge_collision] {collision_area=}")
+                print(f"[_judge_collision] {collision_judge=}")
+            return collision_judge
+
+        collision_judge = _judge_collision(
+            humans_image_mask_warped, humans_depth_warped, humans_height_warped, bkg_metric_depth
+        )
+        humans_image_mask_warped[collision_judge] = 0
+        humans_depth_warped[collision_judge] = LARGEST_DEPTH
+        del humans_height_map, humans_height_warped
 
         # blackout the background
         humans_image_mask_warped[:, :, :3] = (
@@ -619,6 +680,10 @@ class HumanComposer(nn.Module):
     def harmonize(
         self, composed: Float[torch.Tensor, "b 3 h w"], mask: Float[torch.Tensor, "b 1 h w"]
     ) -> Float[torch.Tensor, "b 3 h w"]:
+        batch, channel, height, width = composed.shape
+        assert channel == 3, f"{composed.shape=}"
+        assert mask.shape == (batch, 1, height, width), f"{mask.shape=}"
+
         composed_lr = F.interpolate(composed, (256, 256), mode="bilinear")
         mask_lr = F.interpolate(mask, (256, 256), mode="bilinear")
         output = self.harmonizer(composed_lr, composed, mask_lr, mask)
@@ -732,13 +797,14 @@ class HumanComposer(nn.Module):
             calib_result = self.geocalib.calibrate(img[b])
             gravity_vec = calib_result["gravity"].vec3d  # already L2 normalized
             cos_sim = torch.sum(g_normal * gravity_vec)
-            if torch.abs(cos_sim) > 0.9:
-                plane_coeff.append(torch.cat([pa, pb, pc, pd], dim=-1))
-            else:
-                plane_coeff.append(invalid_plane_coeff)
+            plane_coeff.append(
+                torch.cat([pa, pb, pc, pd], dim=-1)
+                if torch.abs(cos_sim) > 0.9
+                else invalid_plane_coeff
+            )
 
             if self.verbose:
-                print(f"batch{b}: {cos_sim=}")
+                print(f"batch{b}: {cos_sim=} => {plane_coeff[-1]}")
 
         plane_coeff = torch.stack(plane_coeff, dim=0)
         del ground_mask, g_mask, ground_points, moge_metric_points
