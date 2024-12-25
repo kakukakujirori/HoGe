@@ -16,14 +16,13 @@ from third_party.MoGe.moge.model import MoGeModel
 from third_party.PCTNet.iharm.inference.utils import load_model
 from third_party.StyleGAN_Human import dnnlib, legacy
 
-STYLEGAN_HUMAN_PKL = (
-    "/home/ryotaro/github/StyleGAN-Human/pretrained_models/stylegan_human_v2_1024.pkl"
-)
+STYLEGAN_HUMAN_PKL = "/home/ryotaro/my_works/HoGe/third_party/StyleGAN_Human/pretrained_models/stylegan_human_v2_1024.pkl"
 HARMONIZER_WEIGHT = (
     "/home/ryotaro/my_works/HoGe/third_party/PCTNet/pretrained_models/PCTNet_ViT.pth"
 )
 
 LARGEST_DEPTH = 1000
+HUMAN_GEN_BATCH = 8  # largest batch size that fits in GPU memory
 
 
 class HumanCompositionError(Exception):
@@ -814,7 +813,6 @@ class HumanComposer(nn.Module):
         if self.verbose:
             print(f"[generate_humans] {human_num=}")
 
-        HUMAN_GEN_BATCH = 8  # batch=8 fits in GPU memory
         quotient, remainder = divmod(human_num, HUMAN_GEN_BATCH)
         humans, humans_mask = [], []
         for _ in range(quotient):

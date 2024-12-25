@@ -24,9 +24,7 @@ from third_party.MoGe.moge.model import MoGeModel
 from third_party.PCTNet.iharm.inference.utils import load_model
 from third_party.StyleGAN_Human import dnnlib, legacy
 
-STYLEGAN_HUMAN_PKL = (
-    "/home/ryotaro/github/StyleGAN-Human/pretrained_models/stylegan_human_v2_1024.pkl"
-)
+STYLEGAN_HUMAN_PKL = "/home/ryotaro/my_works/HoGe/third_party/StyleGAN_Human/pretrained_models/stylegan_human_v2_1024.pkl"
 HARMONIZER_WEIGHT = (
     "/home/ryotaro/my_works/HoGe/third_party/PCTNet/pretrained_models/PCTNet_ViT.pth"
 )
