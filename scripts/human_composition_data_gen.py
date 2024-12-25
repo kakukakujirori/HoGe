@@ -12,6 +12,8 @@ import lightning as L
 import numpy as np
 import rootutils
 import torch
+from einops import rearrange
+from kornia.filters import gaussian_blur2d
 from PIL import Image
 from tqdm import tqdm
 
@@ -43,7 +45,7 @@ GENERATE_FROM_SCRATCH = False
 def generate(
     dl3dv_dir: str = "/disk2/DL3DV-10K",
     outdir: str = "/disk2/DL3DV-10K_composed",
-    total_gen_num: int = 10000,
+    total_gen_num: int = 100000,
     max_human_num_range: tuple[int, int] = (6, 46),
     human_min_depth_range: tuple[float, float] = (0.5, 5),
     human_max_depth_range: tuple[float, float] = (15, 20),
@@ -58,8 +60,6 @@ def generate(
         .eval()
         .to(device)
     )
-
-    height, width = 540, 960
 
     ####
 
@@ -86,26 +86,19 @@ def generate(
             savedir = os.path.join(outdir, f"{subfolder}K/{os.path.basename(scene_hash)}/images_4")
             os.makedirs(savedir, exist_ok=True)
 
-            # skip completed folder
-            if (
-                not GENERATE_FROM_SCRATCH
-                and os.path.isdir(savedir)
-                and len(glob.glob(os.path.join(savedir, "*"))) > 0
-            ):
-                print(f"Skipping {savedir}...")
-                continue
-
             for imgpath in image_list[::interval]:
+                frame_num = os.path.basename(imgpath).split(".")[0]
+                composed_path = os.path.join(savedir, f"{frame_num}_composed_{date}.png")
+                if not GENERATE_FROM_SCRATCH and os.path.isfile(composed_path):
+                    print(f"Skipping {composed_path}...")
+                    continue
+
                 # load an image
                 bg = cv2.imread(imgpath)
                 bg = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
-                bg_t = (
-                    torch.tensor(
-                        cv2.resize(bg, (width, height)), dtype=torch.float, device=device
-                    ).permute(2, 0, 1)
-                    / 255
-                )
+                bg_t = torch.tensor(bg, dtype=torch.float, device=device).permute(2, 0, 1) / 255
                 img = torch.stack([bg_t], dim=0)
+                _, _, height, width = img.shape
 
                 # inference
                 with torch.inference_mode():
@@ -116,9 +109,6 @@ def generate(
                         # apply gaussian blur (StyleGAN-Human is too crisp, so it doesn't fit the DL3DV-10K scenes)
                         apply_gaussian_blur = True
                         if apply_gaussian_blur:
-                            from einops import rearrange
-                            from kornia.filters import gaussian_blur2d
-
                             rgb_ori, alpha = torch.split(composed_rgba, [3, 1], dim=1)
                             rgb_new = gaussian_blur2d(rgb_ori, (3, 3), (0.5, 0.5))
                             rgb_new = (1 - alpha) * rgb_ori + alpha * rgb_new
@@ -167,13 +157,11 @@ def generate(
                 torch.cuda.empty_cache()
 
                 # save outputs
-                frame_num = os.path.basename(imgpath).split(".")[0]
-
                 area_per_label = np.bincount(composed_label.flatten())
                 removed_labels = []
                 if area_per_label.shape != (256,):
                     print(
-                        f"[ERROR] Maybe the background is completely invisible? Skipping {imgpath}...\n({area_per_label=})"
+                        f"\n\n\n[ERROR] Maybe the background is completely invisible? Skipping {imgpath}...\n({area_per_label=})\n\n\n"
                     )
                     continue
                 for idx, person_rgba in enumerate(human_images):
@@ -182,17 +170,15 @@ def generate(
                         removed_labels.append(idx)
                         continue
                     Image.fromarray(person_rgba).save(
-                        os.path.join(savedir, f"{frame_num}_composed_{date}_person_{idx}.png")
+                        composed_path.replace(".png", f"_person_{idx}.png")
                     )
 
                 composed_label = np.where(
                     np.isin(composed_label, removed_labels), 255, composed_label
                 )
-                Image.fromarray(composed_rgba).save(
-                    os.path.join(savedir, f"{frame_num}_composed_{date}.png")
-                )
+                Image.fromarray(composed_rgba).save(composed_path)
                 Image.fromarray(composed_label).save(
-                    os.path.join(savedir, f"{frame_num}_composed_{date}_label.png")
+                    composed_path.replace(".png", "_label.png")
                 )  # DON'T USE JPEG!!!!!!
 
                 # increment the counter
@@ -220,13 +206,13 @@ if __name__ == "__main__":
         "--outdir", type=str, default="/disk1/ryotaro/data/DL3DV-10K_composed", help="Save path"
     )
     parser.add_argument(
-        "--total_gen_num", type=int, default=10000, help="Number of generating images"
+        "--total_gen_num", type=int, default=100000, help="Number of generating images"
     )
     parser.add_argument(
         "--max_human_num_range",
         type=int,
         nargs="+",
-        default=(6, 46),
+        default=(6, 48),
         help="Maximum number of people in a scene",
     )
     parser.add_argument(

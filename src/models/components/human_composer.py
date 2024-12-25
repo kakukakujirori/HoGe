@@ -709,6 +709,7 @@ class HumanComposer(nn.Module):
         # assume humans are sorted from back to front (0 -> farthest)
         humans_image_mask.nan_to_num_(nan=0)
         humans_depth.nan_to_num_(nan=1e10)
+        background_depth.nan_to_num_(LARGEST_DEPTH).clamp_max_(LARGEST_DEPTH)
         # humans_valid_depth = (0 < humans_depth) * (humans_depth < LARGEST_DEPTH - 1)
         # humans_mean_depth = torch.sum(humans_depth * humans_valid_depth, dim=[2, 3, 4]) / (1 + torch.sum(humans_valid_depth, dim=[2, 3, 4]))
         # assert torch.all(humans_mean_depth[:, :-1] >= humans_mean_depth[:, 1:]), f"{humans_mean_depth=}"
@@ -781,7 +782,7 @@ class HumanComposer(nn.Module):
             if ground_points.shape[0] == 0:
                 plane_coeff.append(invalid_plane_coeff)
                 if self.verbose:
-                    print(f"batch{b}: ground not detected")
+                    print(f"[WARNING] batch{b}: ground not detected")
                 continue
 
             # Skip RANSAC for now. Maybe necessary in the future???
