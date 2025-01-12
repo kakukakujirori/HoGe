@@ -105,7 +105,9 @@ COLLISION_RATIO_THRESH = 0.01
 
 LABEL_OFFSET = 1000
 
-VERBOSE = True
+JSON_SAVE_FREQ = 1000
+
+VERBOSE = False
 
 
 # In[2]:
@@ -1226,27 +1228,63 @@ def register_composed_result(
     return new_annot_list_per_img, composed_obj_num
 
 
+def save_json(
+        img_list: list[int],
+        annot_list: list[dict[str, Any]],
+        json_outpath: str,
+        coco: COCO,
+    ):
+    assert json_outpath.endswith(".json")
+
+    # save into a json file
+    json_data = {
+        "images": img_list,
+        "annotations": annot_list,
+        "categories": list(coco.cats.values()),
+    }
+    with open(json_outpath, "w") as f:
+        json.dump(json_data, f)
+
+
+def load_json(json_path: str):
+    with open(json_path, "r") as f:
+        json_data = json.load(f)
+
+    img_list = json_data["images"]
+    annot_list = json_data["annotations"]
+    return img_list, annot_list
+
 # In[ ]:
 
 
 if __name__ == '__main__':
     coco_root_dir = "/media/ryotaro/ssd1/coco/"
-    is_train_or_val = "val"
-    image_save_dir = "fuga" #os.path.join(coco_root_dir, f"{is_train_or_val}2017_composed_refactered")
-
-    if os.path.isdir(image_save_dir) and os.listdir(image_save_dir):
-        print(f"Manually remove {image_save_dir} first!!!")
-        exit()
+    is_train_or_val = "train"
+    image_save_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017_composed_refactered")
 
     img_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017")
     coco = COCO(os.path.join(coco_root_dir, f"annotations/instances_{is_train_or_val}2017.json"))
     annot_id_list = coco.getAnnIds(catIds=[])
 
-    os.makedirs(image_save_dir, exist_ok=True)
     new_img_list = []
+    new_img_set = set()
     new_annot_list = []
 
+    # load json if exists (assuming the process was interrupted in the middle)
+    json_outpath = os.path.join(coco_root_dir, f"annotations/instances_{is_train_or_val}2017_kakuda_composition_labels_refactored.json")
+    if os.path.isfile(json_outpath):
+        dprint(f"[main] Loading {json_outpath}, assuming that the process was interrupted in the middle.")
+        new_img_list, new_annot_list = load_json(json_outpath)
+        new_img_set = {int(img_meta["id"]) for img_meta in new_img_list}
+    elif os.path.isdir(image_save_dir) and os.listdir(image_save_dir):
+        print(f"[main] Manually remove {image_save_dir} first!!! (since {json_outpath} does not exist)")
+        exit()
+    os.makedirs(image_save_dir, exist_ok=True)
+
     for img_id in tqdm(coco.getImgIds()):
+        if img_id in new_img_set:
+            continue
+
         # compose
         for trial in range(COMPOSITION_RETRY_NUM):
             new_annots_per_img = []
@@ -1289,15 +1327,12 @@ if __name__ == '__main__':
             ret_uint8 = np.clip(255 * composed_img.cpu().numpy(), 0, 255).astype(np.uint8)
             cv2.imwrite(image_save_path, ret_uint8[:, :, ::-1])
             new_img_list.append(coco.imgs[img_id])
+            new_img_set.add(img_id)
             dprint(f"\n{img_id}: saved! (Composed object num: {composed_obj_num})\n")
 
+        if new_img_list and len(new_img_list) % JSON_SAVE_FREQ == 0:
+            save_json(new_img_list, new_annot_list, json_outpath, coco)
 
     # save into a json file
-    json_data = {
-        "images": new_img_list,
-        "annotations": new_annot_list,
-        "categories": list(coco.cats.values()),
-    }
-    outpath = os.path.join(coco_root_dir, f"annotations/instances_{is_train_or_val}2017_kakuda_composition_labels_refactored.json")
-    with open(outpath, "w") as f:
-        json.dump(json_data, f)
+    save_json(new_img_list, new_annot_list, json_outpath, coco)
+    print(f"Finished! {json_outpath=}")
