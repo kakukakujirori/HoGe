@@ -1,12 +1,14 @@
 #!/usr/bin/env python
-# coding: utf-8
 
 # In[1]:
 
 
+import glob
+import json
+import os
+import random
+import sys
 from typing import Any
-import glob, json, os, random, sys
-from tqdm import tqdm
 
 import cv2
 import depth_pro
@@ -17,16 +19,14 @@ import pycocotools
 import torch
 import torch.nn.functional as F
 import torchvision
-
 from einops import rearrange
-from geocalib import GeoCalib
-from kornia.color import rgb_to_hsv, hsv_to_rgb
+from jaxtyping import Float, Int64, UInt8
+from kornia.color import hsv_to_rgb, rgb_to_hsv
 from kornia.contrib import connected_components
 from kornia.filters import box_blur, canny
 from kornia.geometry.homography import find_homography_dlt
 from kornia.geometry.transform import warp_perspective
-from kornia.morphology import dilation, erosion, opening, closing
-from jaxtyping import Float, UInt8, Int64
+from kornia.morphology import closing, dilation, erosion, opening
 from pycocotools.coco import COCO
 from pytorch3d.ops import knn_points
 from pytorch3d.transforms import axis_angle_to_matrix
@@ -34,12 +34,15 @@ from skimage.measure import find_contours
 from skimage.transform import resize
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
+from tqdm import tqdm
 from transformers import (
     OneFormerForUniversalSegmentation,
     OneFormerProcessor,
-    VitMatteImageProcessor,
     VitMatteForImageMatting,
+    VitMatteImageProcessor,
 )
+
+from geocalib import GeoCalib
 
 sys.path.append("../")
 from third_party.MoGe.moge.model import MoGeModel
@@ -57,11 +60,27 @@ ONEFORMER_ADE20K = True
 USE_NATTEN = False
 if ONEFORMER_ADE20K:
     if USE_NATTEN:
-        oneformer_processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_dinat_large")
-        oneformer = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_dinat_large").eval().to(device)
+        oneformer_processor = OneFormerProcessor.from_pretrained(
+            "shi-labs/oneformer_ade20k_dinat_large"
+        )
+        oneformer = (
+            OneFormerForUniversalSegmentation.from_pretrained(
+                "shi-labs/oneformer_ade20k_dinat_large"
+            )
+            .eval()
+            .to(device)
+        )
     else:
-        oneformer_processor = OneFormerProcessor.from_pretrained("shi-labs/oneformer_ade20k_swin_large")
-        oneformer = OneFormerForUniversalSegmentation.from_pretrained("shi-labs/oneformer_ade20k_swin_large").eval().to(device)
+        oneformer_processor = OneFormerProcessor.from_pretrained(
+            "shi-labs/oneformer_ade20k_swin_large"
+        )
+        oneformer = (
+            OneFormerForUniversalSegmentation.from_pretrained(
+                "shi-labs/oneformer_ade20k_swin_large"
+            )
+            .eval()
+            .to(device)
+        )
 
     oneformer_task_inputs = oneformer_processor._preprocess_text(["the task is semantic"])
     oneformer_ground_labels = torch.tensor(
@@ -87,12 +106,20 @@ else:
 
 # Metric depth
 geocalib = GeoCalib().eval().to(device)
-metric3dv2 = torch.hub.load("yvanyin/metric3d", "metric3d_vit_small", pretrain=True).eval().to(device)
+metric3dv2 = (
+    torch.hub.load("yvanyin/metric3d", "metric3d_vit_small", pretrain=True).eval().to(device)
+)
 moge = MoGeModel.from_pretrained("Ruicheng/moge-vitl").eval().to(device)
 
 # ViTMatte
-vitmatte_processor = VitMatteImageProcessor.from_pretrained("hustvl/vitmatte-small-distinctions-646")
-vitmatte = VitMatteForImageMatting.from_pretrained("hustvl/vitmatte-small-distinctions-646").eval().to(device)
+vitmatte_processor = VitMatteImageProcessor.from_pretrained(
+    "hustvl/vitmatte-small-distinctions-646"
+)
+vitmatte = (
+    VitMatteForImageMatting.from_pretrained("hustvl/vitmatte-small-distinctions-646")
+    .eval()
+    .to(device)
+)
 
 # Hyper parameters
 COMPOSITION_RETRY_NUM = 3
@@ -119,7 +146,8 @@ class CompositionError(Exception):
 
 
 def dprint(*arg):
-    if VERBOSE: print(*arg, flush=True)
+    if VERBOSE:
+        print(*arg, flush=True)
     return
 
 
@@ -127,11 +155,11 @@ def dprint(*arg):
 
 
 def PCA(
-        data: Float[Tensor, "b n m"],
-        weights: Float[torch.Tensor, "b n"] = None,
-        correlation: bool = False,
-        sort: bool = True,
-    ) -> tuple[Float[Tensor, "b m"], Float[Tensor, "b m m"]]:
+    data: Float[Tensor, "b n m"],
+    weights: Float[torch.Tensor, "b n"] = None,
+    correlation: bool = False,
+    sort: bool = True,
+) -> tuple[Float[Tensor, "b m"], Float[Tensor, "b m m"]]:
     """Applies Batch PCA to input tensor.
 
     Parameters
@@ -166,7 +194,9 @@ def PCA(
 
     # Subtract mean along record dimension
     if weights is not None:
-        mean = (data * weights.unsqueeze(-1)).sum(dim=1, keepdim=True) / weights.sum(dim=1, keepdim=True)
+        mean = (data * weights.unsqueeze(-1)).sum(dim=1, keepdim=True) / weights.sum(
+            dim=1, keepdim=True
+        )
     else:
         mean = data.mean(dim=1, keepdim=True)
     data_adjusted = data - mean
@@ -183,12 +213,18 @@ def PCA(
             B, N, D = points.size()
 
             if weights is not None:
-                weights = weights / (1e-6 + weights.sum(dim=1, keepdim=True))  # Normalize weights so they sum to 1 along the N dim
+                weights = weights / (
+                    1e-6 + weights.sum(dim=1, keepdim=True)
+                )  # Normalize weights so they sum to 1 along the N dim
 
                 mean = (points * weights.unsqueeze(-1)).sum(dim=1, keepdim=True)
                 diffs = (points - mean).reshape(B * N, D)
-                prods = torch.bmm(diffs.unsqueeze(2) * weights.reshape(B * N, 1, 1), diffs.unsqueeze(1)).reshape(B, N, D, D)
-                bcov = prods.sum(dim=1)  # Note that we don't need to divide by N-1 because the weights sum to one.
+                prods = torch.bmm(
+                    diffs.unsqueeze(2) * weights.reshape(B * N, 1, 1), diffs.unsqueeze(1)
+                ).reshape(B, N, D, D)
+                bcov = prods.sum(
+                    dim=1
+                )  # Note that we don't need to divide by N-1 because the weights sum to one.
             else:
                 mean = points.mean(dim=1).unsqueeze(1)
                 diffs = (points - mean).reshape(B * N, D)
@@ -215,9 +251,9 @@ def PCA(
 
 
 def best_fitting_plane(
-        points: Float[torch.Tensor, "b n 3"],
-        weights: Float[torch.Tensor, "b n"] = None,
-    ) -> tuple[Float[torch.Tensor, "b 4"], Float[torch.Tensor, "b"]]:
+    points: Float[torch.Tensor, "b n 3"],
+    weights: Float[torch.Tensor, "b n"] = None,
+) -> tuple[Float[torch.Tensor, "b 4"], Float[torch.Tensor, " b"]]:
     """Computes the best fitting plane for batched points.
 
     Parameters
@@ -242,21 +278,28 @@ def best_fitting_plane(
     assert channel == 3
     assert torch.isfinite(points).all()
     if weights is not None:
-        assert weights.shape == (batch, num), f"Invalid weights shape: {weights.shape} ({points.shape=})"
+        assert weights.shape == (
+            batch,
+            num,
+        ), f"Invalid weights shape: {weights.shape} ({points.shape=})"
         assert torch.all(weights >= 0), "Weights must be non-negative."
 
     # Compute PCA for each batch of points
     try:
         eigenvalues, eigenvectors = PCA(points, weights)
     except torch._C._LinAlgError as e:
-        raise CompositionError(f"[best_fitting_plane] torch.linalg.eigh didn't converge in PCA: {e}")
+        raise CompositionError(
+            f"[best_fitting_plane] torch.linalg.eigh didn't converge in PCA: {e}"
+        )
 
     # The normal is the last eigenvector (smallest eigenvalue)
     normal = eigenvectors[:, :, 2]
 
     # Get mean point for each batch
     if weights is not None:
-        center_point = (points * weights.unsqueeze(-1)).sum(dim=1) / weights.sum(dim=1, keepdim=True)
+        center_point = (points * weights.unsqueeze(-1)).sum(dim=1) / weights.sum(
+            dim=1, keepdim=True
+        )
         assert torch.isfinite(input=center_point).all(), f"{weights.sum(dim=1, keepdim=True)=}"
     else:
         center_point = points.mean(dim=1)
@@ -266,7 +309,12 @@ def best_fitting_plane(
     d = -(normal * center_point).sum(dim=1)
 
     # normalize the normal vector
-    nunom = a.reshape(-1, 1) * points[:, :, 0] + b.reshape(-1, 1) * points[:, :, 1] + c.reshape(-1, 1) * points[:, :, 2] + d.reshape(-1, 1)
+    nunom = (
+        a.reshape(-1, 1) * points[:, :, 0]
+        + b.reshape(-1, 1) * points[:, :, 1]
+        + c.reshape(-1, 1) * points[:, :, 2]
+        + d.reshape(-1, 1)
+    )
     denom = torch.sqrt(a * a + b * b + c * c) + 1e-6
     error = (nunom / (denom + 1e-6)).mean(dim=1)
 
@@ -276,11 +324,15 @@ def best_fitting_plane(
 # In[4]:
 
 
-def infer_metric_points_and_focal(img: Float[Tensor, "3 h w"]) -> tuple[Float[Tensor, "h w 3"], Float[Tensor, "3 3"]]:
+def infer_metric_points_and_focal(
+    img: Float[Tensor, "3 h w"]
+) -> tuple[Float[Tensor, "h w 3"], Float[Tensor, "3 3"]]:
     channel, height, width = img.shape
     assert channel == 3
 
-    def unproject(depth: Float[Tensor, "h w"], f_px: float, height: int, width: int) -> Float[Tensor, "h w"]:
+    def unproject(
+        depth: Float[Tensor, "h w"], f_px: float, height: int, width: int
+    ) -> Float[Tensor, "h w"]:
         y, x = torch.meshgrid(
             torch.arange(height, dtype=depth.dtype, device=depth.device),
             torch.arange(width, dtype=depth.dtype, device=depth.device),
@@ -322,9 +374,7 @@ def infer_semantic_mask(img: Float[Tensor, "3 h w"]) -> Float[Tensor, "h w"]:
         device=img.device,
     ).reshape(1, 3, 1, 1)
 
-    scale_factor = oneformer_processor.image_processor.size["shortest_edge"] / min(
-        img.shape[-2:]
-    )
+    scale_factor = oneformer_processor.image_processor.size["shortest_edge"] / min(img.shape[-2:])
     pixel_values = F.interpolate(img, scale_factor=scale_factor, mode="bilinear")
     pixel_values *= 255 * oneformer_processor.image_processor.rescale_factor
     pixel_values = (pixel_values - mean) / std
@@ -346,12 +396,12 @@ def infer_semantic_mask(img: Float[Tensor, "3 h w"]) -> Float[Tensor, "h w"]:
 
 
 def is_object_unoccluded(
-        mask: Float[Tensor, "h w"],
-        depth: Float[Tensor, "h w"],
-        edge_iou_thresh: float = 0.05,
-        depth_border_ratio_thresh: float = 0.99,
-        depth_border_positive_thresh: float = 0.9,
-    ) -> bool:
+    mask: Float[Tensor, "h w"],
+    depth: Float[Tensor, "h w"],
+    edge_iou_thresh: float = 0.05,
+    depth_border_ratio_thresh: float = 0.99,
+    depth_border_positive_thresh: float = 0.9,
+) -> bool:
     assert mask.shape == depth.shape
     height, width = mask.shape
     mask = mask.reshape(1, 1, height, width)
@@ -361,16 +411,16 @@ def is_object_unoccluded(
     obj_depth_min = max(0, torch.quantile(depth[mask > 0.5], 0.05) - 1)
     obj_depth_max = torch.quantile(depth[mask > 0.5], 0.95) + 1
     dprint(f"[is_object_unoccluded] {obj_depth_min=}, {obj_depth_max=}")
-    depth_normalized = torch.clip(
-        (depth - obj_depth_min) / (obj_depth_max - obj_depth_min), 0, 1
-    )
+    depth_normalized = torch.clip((depth - obj_depth_min) / (obj_depth_max - obj_depth_min), 0, 1)
     _, depth_edge = canny(depth_normalized)
     _, mask_edge = canny(mask)
 
     mask_depth_edge_iou = torch.sum(depth_edge * mask_edge) / (1e-6 + torch.sum(mask_edge))
     dprint(f"[is_object_unoccluded] {mask_depth_edge_iou.item()=}")
     if mask_depth_edge_iou < edge_iou_thresh:
-        dprint(f"[is_object_unoccluded] Mask and Depth doesn't align well. Occlusion cannot be judged from them.")
+        dprint(
+            "[is_object_unoccluded] Mask and Depth doesn't align well. Occlusion cannot be judged from them."
+        )
         return False
 
     # whole/partial check
@@ -395,21 +445,28 @@ def is_object_unoccluded(
 
 def is_simply_connected(mask: Float[np.ndarray, "h w"]):
     assert isinstance(mask, np.ndarray)
-    totalLabels, label_ids, values, centroid = cv2.connectedComponentsWithStats(mask, 4, cv2.CV_32S)
+    totalLabels, label_ids, values, centroid = cv2.connectedComponentsWithStats(
+        mask, 4, cv2.CV_32S
+    )
     dprint(f"[is_simply_connected] {totalLabels=}")
     return totalLabels == 2
 
 
 def denoise_disconnected_obj_points(
-        obj_masks: Float[torch.Tensor, "b h w"],
-        obj_points: Float[torch.Tensor, "(b) h w 3"],
-        knn_num: int = 10,
-        knn_threshold: float = 0.1,
-        remove_isolated_components: bool = True,
-        apply_closing: bool = True,
-    ) -> Float[Tensor, "b h w"]:
+    obj_masks: Float[torch.Tensor, "b h w"],
+    obj_points: Float[torch.Tensor, "(b) h w 3"],
+    knn_num: int = 10,
+    knn_threshold: float = 0.1,
+    remove_isolated_components: bool = True,
+    apply_closing: bool = True,
+) -> Float[Tensor, "b h w"]:
     obj_batch, height, width = obj_masks.shape
-    assert obj_points.shape == (height, width, 3) or obj_points.shape == (obj_batch, height, width, 3)
+    assert obj_points.shape == (height, width, 3) or obj_points.shape == (
+        obj_batch,
+        height,
+        width,
+        3,
+    )
     if len(obj_points.shape) == 3:
         obj_points = obj_points[None].expand(obj_batch, -1, -1, -1)
 
@@ -424,7 +481,9 @@ def denoise_disconnected_obj_points(
     obj_points_packed = pad_sequence(obj_points_list, batch_first=True)
     obj_points_len = torch.tensor(obj_points_len, dtype=torch.long, device=obj_masks.device)
 
-    nn_dists, nn_idx, nn = knn_points(obj_points_packed, obj_points_packed, obj_points_len, obj_points_len, K=knn_num+1)
+    nn_dists, nn_idx, nn = knn_points(
+        obj_points_packed, obj_points_packed, obj_points_len, obj_points_len, K=knn_num + 1
+    )
 
     obj_masks_denoised = obj_masks.clone()
     for b in range(obj_batch):
@@ -432,7 +491,7 @@ def denoise_disconnected_obj_points(
         point_num = obj_points_len[b]
         msk = obj_masks[b]
         knn_map = torch.ones_like(obj_masks[b])
-        knn_map[msk > 0.5] = nn_dists[0,:point_num,1:].mean(dim=1)
+        knn_map[msk > 0.5] = nn_dists[0, :point_num, 1:].mean(dim=1)
         obj_masks_denoised[b, knn_map > knn_threshold**2] = 0
 
         # discard isorated clusters (NOTE: assuming that the original mask is simply connected)
@@ -442,33 +501,43 @@ def denoise_disconnected_obj_points(
                 num_iterations=1000,
             ).reshape(height, width)
             component_labels = torch.sort(torch.unique(component_labelmap)).values
-            component_labelmap = torch.searchsorted(component_labels, input=component_labelmap)  # make the label consequtive
+            component_labelmap = torch.searchsorted(
+                component_labels, input=component_labelmap
+            )  # make the label consecutive
             component_areas = torch.bincount(component_labelmap.reshape(-1))
             if len(component_areas) == 1:
-                raise CompositionError("[denoise_disconnected_obj_points] Object disappeared after denoising")
+                raise CompositionError(
+                    "[denoise_disconnected_obj_points] Object disappeared after denoising"
+                )
             major_component = component_labelmap == 1 + component_areas[1:].argmax()
             obj_masks_denoised[b] *= major_component
 
     # fill in tiny holes inside objects
     if apply_closing:
         closing_kernel = torch.ones(3, 3, dtype=obj_masks.dtype, device=obj_masks.device)
-        obj_masks_denoised = closing(obj_masks_denoised.reshape(obj_batch, 1, height, width), closing_kernel).reshape(obj_batch, height, width)
+        obj_masks_denoised = closing(
+            obj_masks_denoised.reshape(obj_batch, 1, height, width), closing_kernel
+        ).reshape(obj_batch, height, width)
 
     return obj_masks_denoised
 
 
 def is_object_on(
-        object_points: Float[Tensor, "n 3"],
-        support_points: Float[Tensor, "m 3"],
-        local_support_plane_fitting: bool = True,
-        near_distance_thresh: float = 0.1,
-    ) -> tuple[bool, Float[Tensor, "4"]]:
+    object_points: Float[Tensor, "n 3"],
+    support_points: Float[Tensor, "m 3"],
+    local_support_plane_fitting: bool = True,
+    near_distance_thresh: float = 0.1,
+) -> tuple[bool, Float[Tensor, "4"]]:
     assert len(object_points.shape) == 2 and object_points.shape[1] == 3, f"{object_points.shape=}"
-    assert len(support_points.shape) == 2 and support_points.shape[1] == 3, f"{support_points.shape=}"
+    assert (
+        len(support_points.shape) == 2 and support_points.shape[1] == 3
+    ), f"{support_points.shape=}"
 
     if local_support_plane_fitting:
         object_center = object_points.mean(dim=0, keepdim=True)
-        plane_fitting_weight = 1 / torch.square(support_points - object_center).sum(dim=-1).clip(1, None)
+        plane_fitting_weight = 1 / torch.square(support_points - object_center).sum(dim=-1).clip(
+            1, None
+        )
 
         plane_coeffs, plane_fitting_error = best_fitting_plane(
             points=support_points.reshape(1, -1, 3),
@@ -481,8 +550,12 @@ def is_object_on(
         plane_coeffs = plane_coeffs * torch.where(pb_sign == 0, torch.ones_like(pb_sign), pb_sign)
 
         # get the distance from the object points to the ground
-        object_points_homogeneous = torch.cat([object_points, torch.ones_like(object_points[:, 0:1])], dim=-1)
-        dists = (plane_coeffs * object_points_homogeneous).sum(dim=-1).abs() / (torch.norm(plane_coeffs[:, :3], dim=-1) + 1e-6)
+        object_points_homogeneous = torch.cat(
+            [object_points, torch.ones_like(object_points[:, 0:1])], dim=-1
+        )
+        dists = (plane_coeffs * object_points_homogeneous).sum(dim=-1).abs() / (
+            torch.norm(plane_coeffs[:, :3], dim=-1) + 1e-6
+        )
         assert dists.shape == (object_points.shape[0],), f"{dists.shape=}"
         dprint(f"[is_object_on] Distance from the support: {dists.min().item():.6f}")
 
@@ -495,30 +568,34 @@ def is_object_on(
 
 
 def is_plane_orthogonal_to_gravity(
-        plane_normal: Float[Tensor, "3"],
-        gravity_direction: Float[Tensor, "3"],
-        cosine_threshold: float = 0.95,
-    ):
+    plane_normal: Float[Tensor, "3"],
+    gravity_direction: Float[Tensor, "3"],
+    cosine_threshold: float = 0.95,
+):
     assert plane_normal.shape == gravity_direction.shape == (3,)
-    cos_sim = torch.sum(F.normalize(plane_normal, dim=0) * F.normalize(gravity_direction, dim=0)).abs()
+    cos_sim = torch.sum(
+        F.normalize(plane_normal, dim=0) * F.normalize(gravity_direction, dim=0)
+    ).abs()
     dprint(f"[is_plane_orthogonal_to_gravity] {cos_sim.item()=}")
     return cos_sim > cosine_threshold
 
 
 def is_object_planar(
-        object_points: Float[Tensor, "n 3"],
-        plane_fitting_depth_margin: float = 0.2,
-    ):
+    object_points: Float[Tensor, "n 3"],
+    plane_fitting_depth_margin: float = 0.2,
+):
     assert len(object_points.shape) == 2 and object_points.shape[1] == 3, f"{object_points.shape=}"
 
     object_depths = object_points[:, 2]
     object_depth_median = torch.median(object_depths)
     object_points_for_fitting = object_points[
-        (object_depth_median - plane_fitting_depth_margin < object_depths) *
-        (object_depths < object_depth_median + plane_fitting_depth_margin)
+        (object_depth_median - plane_fitting_depth_margin < object_depths)
+        * (object_depths < object_depth_median + plane_fitting_depth_margin)
     ]
 
-    plane_fitting_weight = 1 / torch.square(object_points_for_fitting[:, 2].reshape(1, -1) - object_depth_median).clip(0.0001, None)
+    plane_fitting_weight = 1 / torch.square(
+        object_points_for_fitting[:, 2].reshape(1, -1) - object_depth_median
+    ).clip(0.0001, None)
     plane_coeffs, plane_fitting_error = best_fitting_plane(
         points=object_points_for_fitting.reshape(1, -1, 3),
         weights=plane_fitting_weight.reshape(1, -1),
@@ -529,7 +606,9 @@ def is_object_planar(
     pc_sign = torch.sign(plane_coeffs[:, 2])
     plane_coeffs = plane_coeffs * torch.where(pc_sign == 0, torch.ones_like(pc_sign), pc_sign)
 
-    is_planar = plane_coeffs[:, 2].abs() > torch.max(plane_coeffs[:, 0].abs(), plane_coeffs[:, 1].abs())
+    is_planar = plane_coeffs[:, 2].abs() > torch.max(
+        plane_coeffs[:, 0].abs(), plane_coeffs[:, 1].abs()
+    )
     return is_planar.reshape(1), plane_coeffs.reshape(4)
 
 
@@ -537,14 +616,14 @@ def is_object_planar(
 
 
 def warp_points_at_random(
-        points: Float[Tensor, "h w 3"],
-        depths: Float[Tensor, "h w"],
-        obj_masks: Float[Tensor, "b h w"],
-        ground_mask: Float[Tensor, "h w"],
-        ground_plane_coeff: Float[Tensor, "4"],
-        intrinsics: Float[Tensor, "3 3"],
-        tgt_depth_rel_range: tuple[float, float] = (0.75, 2.5),
-    ) -> tuple[Float[Tensor, "b h w 3"], Float[Tensor, "b 3 3"], Float[Tensor, "b 3"]]:
+    points: Float[Tensor, "h w 3"],
+    depths: Float[Tensor, "h w"],
+    obj_masks: Float[Tensor, "b h w"],
+    ground_mask: Float[Tensor, "h w"],
+    ground_plane_coeff: Float[Tensor, "4"],
+    intrinsics: Float[Tensor, "3 3"],
+    tgt_depth_rel_range: tuple[float, float] = (0.75, 2.5),
+) -> tuple[Float[Tensor, "b h w 3"], Float[Tensor, "b 3 3"], Float[Tensor, "b 3"]]:
     # sanity check
     obj_batch, height, width = obj_masks.shape
     assert points.shape == (height, width, 3)
@@ -572,44 +651,65 @@ def warp_points_at_random(
 
     # search for the source foot positions
     mask_ground_intersection_vertical = torch.any(mask_ground_intersection_binary, dim=-1)
-    _, mask_ground_intersection_vertical_idx, mask_ground_intersection_vertical_px = mask_ground_intersection_vertical.nonzero(as_tuple=True)
+    _, mask_ground_intersection_vertical_idx, mask_ground_intersection_vertical_px = (
+        mask_ground_intersection_vertical.nonzero(as_tuple=True)
+    )
     foot_pix_src_y = mask_ground_intersection_vertical_px[
         mask_ground_intersection_vertical_idx.bincount().cumsum(dim=0) - 1
     ]  # lowest pixel
 
     mask_ground_intersection_horizontal = torch.any(mask_ground_intersection_binary, dim=-2)
-    _, mask_horizontal_idx, mask_horizontal_px = mask_ground_intersection_horizontal.nonzero(as_tuple=True)
+    _, mask_horizontal_idx, mask_horizontal_px = mask_ground_intersection_horizontal.nonzero(
+        as_tuple=True
+    )
     foot_pix_src_x = torch.bincount(
         mask_horizontal_idx, weights=mask_horizontal_px
     ) / torch.bincount(mask_horizontal_idx)
-    foot_pix_src = torch.stack([foot_pix_src_x, foot_pix_src_y, torch.ones_like(foot_pix_src_x)], dim=-1)
+    foot_pix_src = torch.stack(
+        [foot_pix_src_x, foot_pix_src_y, torch.ones_like(foot_pix_src_x)], dim=-1
+    )
     foot_pos_src_z = depths[:, foot_pix_src_y, foot_pix_src_x.int()]
-    foot_pos_src: torch.Tensor = (torch.linalg.inv(intrinsics.float()) @ foot_pix_src.reshape(-1, 3, 1).float()).reshape(bkg_batch, obj_batch, 3) * foot_pos_src_z.reshape(bkg_batch, obj_batch, 1)
+    foot_pos_src: torch.Tensor = (
+        torch.linalg.inv(intrinsics.float()) @ foot_pix_src.reshape(-1, 3, 1).float()
+    ).reshape(bkg_batch, obj_batch, 3) * foot_pos_src_z.reshape(bkg_batch, obj_batch, 1)
     assert foot_pos_src.shape == (bkg_batch, obj_batch, 3)
 
     # target foot position
     tgt_depth_min = foot_pos_src_z * tgt_depth_rel_min
-    tgt_depth_max = torch.minimum(foot_pos_src_z * tgt_depth_rel_max, depths.flatten(-2).max(dim=-1).values)
-    foot_pos_tgt_z = tgt_depth_min + torch.rand_like(foot_pos_src_z) * (tgt_depth_max - tgt_depth_min)
+    tgt_depth_max = torch.minimum(
+        foot_pos_src_z * tgt_depth_rel_max, depths.flatten(-2).max(dim=-1).values
+    )
+    foot_pos_tgt_z = tgt_depth_min + torch.rand_like(foot_pos_src_z) * (
+        tgt_depth_max - tgt_depth_min
+    )
 
     foot_pos_tgt_x_max = (width / 2) * foot_pos_tgt_z / intrinsics[:, 0, 0].reshape(bkg_batch, 1)
     foot_pos_tgt_x = (torch.rand_like(foot_pos_tgt_z) * 2 - 1) * foot_pos_tgt_x_max
 
     PA, PB, PC, PD = torch.split(ground_plane_coeff, 1, dim=-1)
     foot_pos_tgt_y = (-PD - PC * foot_pos_tgt_z - PA * foot_pos_tgt_x) / PB
-    foot_pos_tgt = torch.stack(
-        [foot_pos_tgt_x, foot_pos_tgt_y, foot_pos_tgt_z], dim=-1
-    )
+    foot_pos_tgt = torch.stack([foot_pos_tgt_x, foot_pos_tgt_y, foot_pos_tgt_z], dim=-1)
     assert foot_pos_tgt.shape == (bkg_batch, obj_batch, 3)
 
     # place foot_tgt on the ground_mask if visible (by project & unproject)
-    foot_pix_tgt = (intrinsics.reshape(bkg_batch, 1, 3, 3) @ foot_pos_tgt.reshape(bkg_batch, obj_batch, 3, 1)).reshape(bkg_batch, obj_batch, 3)
-    foot_pix_tgt = (foot_pix_tgt[:, :, :2] / (foot_pix_tgt[:, :, 2:3] + 1e-6))
-    foot_tgt_visible = (0 <= foot_pix_tgt[:, :, 0]) * (foot_pix_tgt[:, :, 0] < width) * (0 <= foot_pix_tgt[:, :, 1]) * (foot_pix_tgt[:, :, 1] < height)
+    foot_pix_tgt = (
+        intrinsics.reshape(bkg_batch, 1, 3, 3) @ foot_pos_tgt.reshape(bkg_batch, obj_batch, 3, 1)
+    ).reshape(bkg_batch, obj_batch, 3)
+    foot_pix_tgt = foot_pix_tgt[:, :, :2] / (foot_pix_tgt[:, :, 2:3] + 1e-6)
+    foot_tgt_visible = (
+        (0 <= foot_pix_tgt[:, :, 0])
+        * (foot_pix_tgt[:, :, 0] < width)
+        * (0 <= foot_pix_tgt[:, :, 1])
+        * (foot_pix_tgt[:, :, 1] < height)
+    )
     foot_pix_tgt = foot_pix_tgt.long()
     foot_pix_tgt[:, :, 0] = foot_pix_tgt[:, :, 0].clip(0, width - 1)
     foot_pix_tgt[:, :, 1] = foot_pix_tgt[:, :, 1].clip(0, height - 1)
-    foot_depth_tgt = depths[torch.arange(bkg_batch).unsqueeze(1).repeat(1, obj_batch), foot_pix_tgt[:, :, 1], foot_pix_tgt[:, :, 0]]
+    foot_depth_tgt = depths[
+        torch.arange(bkg_batch).unsqueeze(1).repeat(1, obj_batch),
+        foot_pix_tgt[:, :, 1],
+        foot_pix_tgt[:, :, 0],
+    ]
     foot_pos_tgt = torch.where(
         foot_tgt_visible * (foot_depth_tgt > foot_pos_tgt[:, :, 2]),
         foot_pos_tgt * foot_depth_tgt / foot_pos_tgt[:, :, 2],
@@ -621,22 +721,41 @@ def warp_points_at_random(
     ground_origin = ground_plane_coeff[:, :3] * (-PD)
     origin_to_src = F.normalize(foot_pos_src - ground_origin, dim=-1)
     origin_to_tgt = F.normalize(foot_pos_tgt - ground_origin, dim=-1)
-    rot_axis = torch.linalg.cross(origin_to_src, origin_to_tgt)  # NOTE: should be the same as ground_plane_coeff[:, :3] removing scale diff
+    rot_axis = torch.linalg.cross(
+        origin_to_src, origin_to_tgt
+    )  # NOTE: should be the same as ground_plane_coeff[:, :3] removing scale diff
     clockwise = torch.sum(rot_axis * ground_plane_coeff[:, :3], dim=-1).sign()
     eps = 1e-7
-    rot_angle = torch.arccos(torch.sum(origin_to_src * origin_to_tgt, dim=-1).clip(-1+eps, 1-eps)) * clockwise
-    rotmat = axis_angle_to_matrix(rot_angle.reshape(bkg_batch, obj_batch, 1) * ground_plane_coeff[:, :3].reshape(bkg_batch, 1, 3))
-    shift = foot_pos_tgt - (rotmat @ foot_pos_src.reshape(bkg_batch, obj_batch, 3, 1)).reshape(bkg_batch, obj_batch, 3)
+    rot_angle = (
+        torch.arccos(torch.sum(origin_to_src * origin_to_tgt, dim=-1).clip(-1 + eps, 1 - eps))
+        * clockwise
+    )
+    rotmat = axis_angle_to_matrix(
+        rot_angle.reshape(bkg_batch, obj_batch, 1)
+        * ground_plane_coeff[:, :3].reshape(bkg_batch, 1, 3)
+    )
+    shift = foot_pos_tgt - (rotmat @ foot_pos_src.reshape(bkg_batch, obj_batch, 3, 1)).reshape(
+        bkg_batch, obj_batch, 3
+    )
     assert rotmat.shape == (bkg_batch, obj_batch, 3, 3)
     assert shift.shape == (bkg_batch, obj_batch, 3)
     dprint(f"[warp_points_at_random] {rot_angle=}")
 
     # warp all foreground points
-    tgt_points = (rotmat.reshape(bkg_batch, obj_batch, 1, 3, 3) @ points.reshape(bkg_batch, 1, height * width, 3, 1)).reshape(bkg_batch, obj_batch, height, width, 3) + shift.reshape(bkg_batch, obj_batch, 1, 1, 3)
+    tgt_points = (
+        rotmat.reshape(bkg_batch, obj_batch, 1, 3, 3)
+        @ points.reshape(bkg_batch, 1, height * width, 3, 1)
+    ).reshape(bkg_batch, obj_batch, height, width, 3) + shift.reshape(
+        bkg_batch, obj_batch, 1, 1, 3
+    )
     assert tgt_points.shape == (bkg_batch, obj_batch, height, width, 3)
 
     # ALSO RETURN SE(3) transform
-    return tgt_points.reshape(obj_batch, height, width, 3), rotmat.reshape(obj_batch, 3, 3), shift.reshape(obj_batch, 3)
+    return (
+        tgt_points.reshape(obj_batch, height, width, 3),
+        rotmat.reshape(obj_batch, 3, 3),
+        shift.reshape(obj_batch, 3),
+    )
 
 
 def detect_collision_above_ground(
@@ -656,18 +775,24 @@ def detect_collision_above_ground(
     assert 0 < collision_dist_thresh < above_ground_dist_thresh
 
     def _get_points_above_ground(
-            points: Float[Tensor, "n 3"],
-            ground_plane_coeff: Float[Tensor, "4"],
-            above_ground_dist_thresh: float,
-        ) -> Float[Tensor, "m 3"]:
+        points: Float[Tensor, "n 3"],
+        ground_plane_coeff: Float[Tensor, "4"],
+        above_ground_dist_thresh: float,
+    ) -> Float[Tensor, "m 3"]:
         points_homogenious = torch.cat([points, torch.ones_like(points[:, 0:1])], dim=-1)
-        points_ground_distance = (ground_plane_coeff.reshape(1, 4) * points_homogenious).sum(dim=-1).abs() / (1e-6 + torch.norm(ground_plane_coeff[:3], dim=-1))
+        points_ground_distance = (ground_plane_coeff.reshape(1, 4) * points_homogenious).sum(
+            dim=-1
+        ).abs() / (1e-6 + torch.norm(ground_plane_coeff[:3], dim=-1))
         return points[points_ground_distance > above_ground_dist_thresh]
 
-    obj_points_above_ground = _get_points_above_ground(obj_points, ground_plane_coeff, above_ground_dist_thresh)
+    obj_points_above_ground = _get_points_above_ground(
+        obj_points, ground_plane_coeff, above_ground_dist_thresh
+    )
 
     if obj_points_above_ground.numel() == 0:
-        dprint(f"[detect_collision_above_ground] All object points are within {above_ground_dist_thresh}m from the ground.")
+        dprint(
+            f"[detect_collision_above_ground] All object points are within {above_ground_dist_thresh}m from the ground."
+        )
         return True
 
     # check knn
@@ -676,7 +801,9 @@ def detect_collision_above_ground(
         bkg_points.reshape(1, -1, 3),
         K=1,
     ).dists
-    collision_ratio = torch.sum(obj_bkg_dist < collision_dist_thresh) / obj_points_above_ground.shape[0]
+    collision_ratio = (
+        torch.sum(obj_bkg_dist < collision_dist_thresh) / obj_points_above_ground.shape[0]
+    )
     return collision_ratio > collision_ratio_thresh
 
 
@@ -691,20 +818,20 @@ def change_object_color_hsv(
     assert 0 <= sv_max_shift <= 1
     mask = mask.reshape(batch, height, width, 1)
 
-    hsv = rgb_to_hsv(image.permute(0,3,1,2)).permute(0,2,3,1)
+    hsv = rgb_to_hsv(image.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
     sv_offset = (torch.rand(batch, 1, 1, 2, device=hsv.device) * 2 - 1) * sv_max_shift
 
     hsv_trans = hsv.clone()
-    hsv_trans[..., 1:] = (hsv[:, :, :, 1:] + sv_offset)
+    hsv_trans[..., 1:] = hsv[:, :, :, 1:] + sv_offset
 
     hsv = (1 - mask) * hsv + mask * hsv_trans
-    return hsv_to_rgb(hsv.permute(0,3,1,2)).permute(0,2,3,1)
+    return hsv_to_rgb(hsv.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
 
 
 def compose_objects_with_background(
     obj_imgs: Float[torch.Tensor, "b h w 3"],
     obj_masks: Float[torch.Tensor, "b h w"],
-    obj_labels: Int64[torch.Tensor, "b"],
+    obj_labels: Int64[torch.Tensor, " b"],
     obj_depths: Float[torch.Tensor, "b h w"],
     bkg_imgs: Float[torch.Tensor, "h w 3"],
     bkg_labels: Int64[torch.Tensor, "h w"],
@@ -724,7 +851,9 @@ def compose_objects_with_background(
     # Assuming bkg_labels consists of -1 (undefined) or large id numbers (like COCO)
     # Newly composed objects are assigned labels as <annot_id * label_offset + obj_cnt>
     assert bkg_labels.dtype == torch.int64
-    assert obj_batch < bkg_labels[0 <= bkg_labels].min()  # to guarantee the above labeling has no overlap
+    assert (
+        obj_batch < bkg_labels[0 <= bkg_labels].min()
+    )  # to guarantee the above labeling has no overlap
 
     # objects should be defined in the finite depth region in the beginning
     assert torch.isfinite(obj_masks).all()
@@ -745,14 +874,13 @@ def compose_objects_with_background(
         lbl = obj_labels[n]
         dep = obj_depths[n]
 
-
-        modal_mask = msk * torch.sigmoid(
-            (ret_depth - dep) / depth_temperature
-        )
-        ret_img = ret_img - (ret_img - fg) * modal_mask.reshape(height,width,1)
+        modal_mask = msk * torch.sigmoid((ret_depth - dep) / depth_temperature)
+        ret_img = ret_img - (ret_img - fg) * modal_mask.reshape(height, width, 1)
         ret_mask = torch.max(ret_mask, modal_mask)
         ret_depth = (1 - modal_mask) * ret_depth + modal_mask * dep
-        ret_label[modal_mask > 0.5] = lbl + n + 1  # NOTE: 1-indexed to prevent id collision with the original labels
+        ret_label[modal_mask > 0.5] = (
+            lbl + n + 1
+        )  # NOTE: 1-indexed to prevent id collision with the original labels
 
     return ret_img, ret_mask, ret_label
 
@@ -760,7 +888,7 @@ def compose_objects_with_background(
 # In[6]:
 
 
-COCO2017_CATEGORIES = set([
+COCO2017_CATEGORIES = {
     1,  # person           (person)
     2,  # bicycle          (vehicle)
     3,  # car              (vehicle)
@@ -770,11 +898,11 @@ COCO2017_CATEGORIES = set([
     # 7,  # train            (vehicle)
     8,  # truck            (vehicle)
     # 9,  # boat             (vehicle)
-    #10,  # traffic light    (outdoor)
-    #11,  # fire hydrant     (outdoor)
-    #13,  # stop sign        (outdoor)
-    #14,  # parking meter    (outdoor)
-    #15,  # bench            (outdoor)
+    # 10,  # traffic light    (outdoor)
+    # 11,  # fire hydrant     (outdoor)
+    # 13,  # stop sign        (outdoor)
+    # 14,  # parking meter    (outdoor)
+    # 15,  # bench            (outdoor)
     16,  # bird             (animal)
     17,  # cat              (animal)
     18,  # dog              (animal)
@@ -785,38 +913,38 @@ COCO2017_CATEGORIES = set([
     23,  # bear             (animal)
     24,  # zebra            (animal)
     25,  # giraffe          (animal)
-    #27,  # backpack         (accessory)
-    #28,  # umbrella         (accessory)
-    #31,  # handbag          (accessory)
-    #32,  # tie              (accessory)
-    #33,  # suitcase         (accessory)
-    #34,  # frisbee          (sports)
-    #35,  # skis             (sports)
-    #36,  # snowboard        (sports)
-    #37,  # sports ball      (sports)
-    #38,  # kite             (sports)
-    #39,  # baseball bat     (sports)
-    #40,  # baseball glove   (sports)
-    #41,  # skateboard       (sports)
-    #42,  # surfboard        (sports)
-    #43,  # tennis racket    (sports)
-    #44,  # bottle           (kitchen)
-    #46,  # wine glass       (kitchen)
-    #47,  # cup              (kitchen)
-    #48,  # fork             (kitchen)
-    #49,  # knife            (kitchen)
-    #50,  # spoon            (kitchen)
-    #51,  # bowl             (kitchen)
-    #52,  # banana           (food)
-    #53,  # apple            (food)
-    #54,  # sandwich         (food)
-    #55,  # orange           (food)
-    #56,  # broccoli         (food)
-    #57,  # carrot           (food)
-    #58,  # hot dog          (food)
-    #59,  # pizza            (food)
-    #60,  # donut            (food)
-    #61,  # cake             (food)
+    # 27,  # backpack         (accessory)
+    # 28,  # umbrella         (accessory)
+    # 31,  # handbag          (accessory)
+    # 32,  # tie              (accessory)
+    # 33,  # suitcase         (accessory)
+    # 34,  # frisbee          (sports)
+    # 35,  # skis             (sports)
+    # 36,  # snowboard        (sports)
+    # 37,  # sports ball      (sports)
+    # 38,  # kite             (sports)
+    # 39,  # baseball bat     (sports)
+    # 40,  # baseball glove   (sports)
+    # 41,  # skateboard       (sports)
+    # 42,  # surfboard        (sports)
+    # 43,  # tennis racket    (sports)
+    # 44,  # bottle           (kitchen)
+    # 46,  # wine glass       (kitchen)
+    # 47,  # cup              (kitchen)
+    # 48,  # fork             (kitchen)
+    # 49,  # knife            (kitchen)
+    # 50,  # spoon            (kitchen)
+    # 51,  # bowl             (kitchen)
+    # 52,  # banana           (food)
+    # 53,  # apple            (food)
+    # 54,  # sandwich         (food)
+    # 55,  # orange           (food)
+    # 56,  # broccoli         (food)
+    # 57,  # carrot           (food)
+    # 58,  # hot dog          (food)
+    # 59,  # pizza            (food)
+    # 60,  # donut            (food)
+    # 61,  # cake             (food)
     62,  # chair            (furniture)
     63,  # couch            (furniture)
     64,  # potted plant     (furniture)
@@ -829,11 +957,11 @@ COCO2017_CATEGORIES = set([
     # 75,  # remote           (electronic)
     # 76,  # keyboard         (electronic)
     # 77,  # cell phone       (electronic)
-    #78,  # microwave        (appliance)
-    #79,  # oven             (appliance)
-    #80,  # toaster          (appliance)
-    #81,  # sink             (appliance)
-    #82,  # refrigerator     (appliance)
+    # 78,  # microwave        (appliance)
+    # 79,  # oven             (appliance)
+    # 80,  # toaster          (appliance)
+    # 81,  # sink             (appliance)
+    # 82,  # refrigerator     (appliance)
     # 84,  # book             (indoor)
     # 85,  # clock            (indoor)
     # 86,  # vase             (indoor)
@@ -841,7 +969,7 @@ COCO2017_CATEGORIES = set([
     # 88,  # teddy bear       (indoor)
     # 89,  # hair drier       (indoor)
     # 90,  # toothbrush       (indoor)
-])
+}
 
 
 # In[7]:
@@ -853,7 +981,7 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
     # load an image and annotations
     img_path = os.path.join(img_dir, coco.imgs[img_id]["file_name"])
     img_np = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
-    img = torch.tensor(img_np, dtype=torch.float32, device=device).permute(2,0,1) / 255
+    img = torch.tensor(img_np, dtype=torch.float32, device=device).permute(2, 0, 1) / 255
     height, width, _ = img_np.shape
 
     # load annotations
@@ -868,7 +996,7 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
         # extract some useful prediction results
         ground_mask = torch.isin(semantic_mask, oneformer_ground_labels)
         if torch.sum(ground_mask > 0.5) < 1024:
-            raise CompositionError(f"[process] No ground detected in the image")
+            raise CompositionError("[process] No ground detected in the image")
         sky_mask = torch.isin(semantic_mask, oneformer_sky_labels)
         depth = points[:, :, 2]
         finite_depth_mask = torch.isfinite(depth) * (~sky_mask)
@@ -885,7 +1013,9 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
                     255,
                     np.where(cv2.dilate(msk_np, np.ones((5, 5))) > 0.5, 128, 0),
                 )
-                pixel_values = vitmatte_processor(images=img_np, trimaps=msk_trimap_np, return_tensors="pt").pixel_values
+                pixel_values = vitmatte_processor(
+                    images=img_np, trimaps=msk_trimap_np, return_tensors="pt"
+                ).pixel_values
                 matting_outputs = vitmatte(pixel_values.to(device))
                 mask = matting_outputs.alphas[..., :height, :width].reshape(height, width)
 
@@ -906,26 +1036,33 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
         for _size, ann, msk in obj_size_ann_masks:
             assert _prev_size >= _size
             _prev_size = _size
-            labelmap[msk > 0.5] = ann['id']
+            labelmap[msk > 0.5] = ann["id"]
             if is_object_unoccluded(msk, depth) and is_simply_connected(coco.annToMask(ann)):
                 # can put normal weight during training
-                unoccluded_annot_ids.append(ann['id'])
+                unoccluded_annot_ids.append(ann["id"])
 
                 # if, moreover, the bbox is inside the image, it is duplicatable
                 bbox = ann["bbox"]  # [sx, sy, w, h]
                 bbox_offset = 10
                 sx, sy, tx, ty = bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]
-                is_bbox_inside = (bbox_offset <= sx) and (bbox_offset <= sy) and (tx + bbox_offset < width) and (ty + bbox_offset < height)
+                is_bbox_inside = (
+                    (bbox_offset <= sx)
+                    and (bbox_offset <= sy)
+                    and (tx + bbox_offset < width)
+                    and (ty + bbox_offset < height)
+                )
 
-                if is_bbox_inside and ann['category_id'] in COCO2017_CATEGORIES:
-                    obj_ann_ids.append(ann['id'])
+                if is_bbox_inside and ann["category_id"] in COCO2017_CATEGORIES:
+                    obj_ann_ids.append(ann["id"])
                     obj_masks.append(msk)
 
         if len(obj_ann_ids) == 0:
-            raise CompositionError(f"[process] All objects are partially occluded.")
+            raise CompositionError("[process] All objects are partially occluded.")
 
         obj_batch = len(obj_ann_ids)
-        obj_masks = torch.stack(obj_masks, dim=0).reshape(obj_batch, height, width) * finite_depth_mask.reshape(1, height, width)
+        obj_masks = torch.stack(obj_masks, dim=0).reshape(
+            obj_batch, height, width
+        ) * finite_depth_mask.reshape(1, height, width)
 
         ##############################
 
@@ -934,7 +1071,7 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
             obj_masks,
             points,
             knn_num=4,
-            knn_threshold=0.2,  #### VERY SENSITIVE (0.1: a bit too small, 0.3: a bit too large) ####
+            knn_threshold=0.2,  # VERY SENSITIVE (0.1: a bit too small, 0.3: a bit too large) ####
             remove_isolated_components=True,
             apply_closing=True,
         )
@@ -954,7 +1091,9 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
                 continue
 
             # 1.5. Check if the object plane is orthogonal to gravity
-            is_plane_horizontal = is_plane_orthogonal_to_gravity(local_ground_plane_coeff[:3], gravity_vec)
+            is_plane_horizontal = is_plane_orthogonal_to_gravity(
+                local_ground_plane_coeff[:3], gravity_vec
+            )
             if not is_plane_horizontal:
                 dprint(f"[process] Object {b} plane is not orthogonal to gravity")
                 continue
@@ -970,7 +1109,7 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
             local_object_plane_coeff_batch.append(local_object_plane_coeff)
 
         if not obj_mask_valid_idx:
-            raise CompositionError(f"[process] No objects are suitable for warping on the ground")
+            raise CompositionError("[process] No objects are suitable for warping on the ground")
 
         obj_batch = len(obj_mask_valid_idx)
         obj_masks = obj_masks[obj_mask_valid_idx].reshape(obj_batch, height, width)
@@ -986,7 +1125,14 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
         homography_rendered_annot_ids = []
 
         points_for_collision = points[finite_depth_mask].reshape(-1, 3)
-        object_sampling_weights = 1 / obj_masks.reshape(obj_batch, height * width).sum(dim=-1).clip(1024, None).float().sqrt()
+        object_sampling_weights = (
+            1
+            / obj_masks.reshape(obj_batch, height * width)
+            .sum(dim=-1)
+            .clip(1024, None)
+            .float()
+            .sqrt()
+        )
         dprint(f"[process] {object_sampling_weights=}")
 
         for k in range(MAX_OBJECT_NUM):
@@ -1009,65 +1155,104 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
 
             # collision check
             if detect_collision_above_ground(
-                    warped_obj_pts,
-                    points_for_collision,
-                    local_ground_plane_coeff_batch[obj_idx],
-                    above_ground_dist_thresh=ABOVE_GROUND_DIST_THRESH,
-                    collision_dist_thresh=COLLISION_DIST_THRESH,
-                    collision_ratio_thresh=COLLISION_RATIO_THRESH,
-                ):
+                warped_obj_pts,
+                points_for_collision,
+                local_ground_plane_coeff_batch[obj_idx],
+                above_ground_dist_thresh=ABOVE_GROUND_DIST_THRESH,
+                collision_dist_thresh=COLLISION_DIST_THRESH,
+                collision_ratio_thresh=COLLISION_RATIO_THRESH,
+            ):
                 dprint(f"[process] Collision detected with object {k}")
                 continue
             else:
                 points_for_collision = torch.cat([points_for_collision, warped_obj_pts], dim=0)
-                assert len(points_for_collision.shape) == 2 and points_for_collision.shape[1] == 3, f"{points_for_collision.shape=}"
+                assert (
+                    len(points_for_collision.shape) == 2 and points_for_collision.shape[1] == 3
+                ), f"{points_for_collision.shape=}"
 
             # approximate warping with a homography by tracing the four bbox corners
-            sx, sy, tx, ty = torchvision.ops.masks_to_boxes(obj_msk.reshape(1, height, width) > 0.5).reshape(4)
-            bbox_pixel_corners = torch.tensor([[sx, sy], [tx, sy], [sx, ty], [tx, ty]], device=sx.device)
+            sx, sy, tx, ty = torchvision.ops.masks_to_boxes(
+                obj_msk.reshape(1, height, width) > 0.5
+            ).reshape(4)
+            bbox_pixel_corners = torch.tensor(
+                [[sx, sy], [tx, sy], [sx, ty], [tx, ty]], device=sx.device
+            )
             fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
-            bbox_world_corners = torch.stack([
-                (bbox_pixel_corners[:, 0] - cx) / fx,
-                (bbox_pixel_corners[:, 1] - cy) / fy,
-                torch.ones_like(bbox_pixel_corners[:, 0]),
-            ], dim=-1)
+            bbox_world_corners = torch.stack(
+                [
+                    (bbox_pixel_corners[:, 0] - cx) / fx,
+                    (bbox_pixel_corners[:, 1] - cy) / fy,
+                    torch.ones_like(bbox_pixel_corners[:, 0]),
+                ],
+                dim=-1,
+            )
 
             obj_pa, obj_pb, obj_pc, obj_pd = local_object_plane_coeff_batch[obj_idx]
-            bbox_corners_plane_depth = -obj_pd / (obj_pa * bbox_world_corners[:, 0] + obj_pb * bbox_world_corners[:, 1] + obj_pc)
+            bbox_corners_plane_depth = -obj_pd / (
+                obj_pa * bbox_world_corners[:, 0] + obj_pb * bbox_world_corners[:, 1] + obj_pc
+            )
             assert torch.all(bbox_corners_plane_depth > 0), f"{bbox_corners_plane_depth=}"
             bbox_corners_unproj = bbox_world_corners * bbox_corners_plane_depth.reshape(4, 1)
-            bbox_corners_warped = rotmat.reshape(1, 3, 3) @ bbox_corners_unproj.reshape(4, 3, 1) + shift.reshape(1, 3, 1)
+            bbox_corners_warped = rotmat.reshape(1, 3, 3) @ bbox_corners_unproj.reshape(
+                4, 3, 1
+            ) + shift.reshape(1, 3, 1)
             bbox_corners_warped_projected = (intrinsics @ bbox_corners_warped).reshape(4, 3)
-            bbox_pixel_corners_tgt = bbox_corners_warped_projected[:, :2] / bbox_corners_warped_projected[:, 2:3]
+            bbox_pixel_corners_tgt = (
+                bbox_corners_warped_projected[:, :2] / bbox_corners_warped_projected[:, 2:3]
+            )
 
             # render with homography
-            homographies = find_homography_dlt(bbox_pixel_corners.float().reshape(1, 4, 2), bbox_pixel_corners_tgt.float().reshape(1, 4, 2))
-            image_mask_depth = torch.cat([
-                img.reshape(1, 3, height, width),
-                obj_msk.reshape(1, 1, height, width),
-                warped_points[:, :, 2].reshape(1, 1, height, width),
-            ], dim=1)
-            image_mask_depth_warped = warp_perspective(image_mask_depth, homographies, (height, width), mode="bilinear", align_corners=False)
+            homographies = find_homography_dlt(
+                bbox_pixel_corners.float().reshape(1, 4, 2),
+                bbox_pixel_corners_tgt.float().reshape(1, 4, 2),
+            )
+            image_mask_depth = torch.cat(
+                [
+                    img.reshape(1, 3, height, width),
+                    obj_msk.reshape(1, 1, height, width),
+                    warped_points[:, :, 2].reshape(1, 1, height, width),
+                ],
+                dim=1,
+            )
+            image_mask_depth_warped = warp_perspective(
+                image_mask_depth,
+                homographies,
+                (height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
 
             # save results
-            homography_rendered_img.append(image_mask_depth_warped[:, :3, :, :].permute(0, 2, 3, 1))
+            homography_rendered_img.append(
+                image_mask_depth_warped[:, :3, :, :].permute(0, 2, 3, 1)
+            )
             homography_rendered_mask.append(image_mask_depth_warped[:, 3, :, :])
             homography_rendered_depth.append(image_mask_depth_warped[:, 4, :, :])
             homography_rendered_annot_ids.append(obj_annot_id)
 
         # compose the rendered images
         if len(homography_rendered_img) == 0:
-            raise CompositionError(f"[process] All warped objects collide the scene")
+            raise CompositionError("[process] All warped objects collide the scene")
 
         obj_batch = len(homography_rendered_img)
         dprint(f"[process] {obj_batch=} (UPDATED)")
-        homography_rendered_img = torch.cat(homography_rendered_img, dim=0).reshape(obj_batch, height, width, 3)
-        homography_rendered_mask = torch.cat(homography_rendered_mask, dim=0).reshape(obj_batch, height, width)
-        homography_rendered_depth = torch.cat(homography_rendered_depth, dim=0).reshape(obj_batch, height, width)
-        homography_rendered_annot_ids = torch.tensor(homography_rendered_annot_ids, dtype=torch.int64, device=device).reshape(obj_batch)
+        homography_rendered_img = torch.cat(homography_rendered_img, dim=0).reshape(
+            obj_batch, height, width, 3
+        )
+        homography_rendered_mask = torch.cat(homography_rendered_mask, dim=0).reshape(
+            obj_batch, height, width
+        )
+        homography_rendered_depth = torch.cat(homography_rendered_depth, dim=0).reshape(
+            obj_batch, height, width
+        )
+        homography_rendered_annot_ids = torch.tensor(
+            homography_rendered_annot_ids, dtype=torch.int64, device=device
+        ).reshape(obj_batch)
 
         # color augmentation
-        homography_rendered_img = change_object_color_hsv(homography_rendered_img, homography_rendered_mask, sv_max_shift=0.2)
+        homography_rendered_img = change_object_color_hsv(
+            homography_rendered_img, homography_rendered_mask, sv_max_shift=0.2
+        )
 
         composed_img, composed_mask, composed_label = compose_objects_with_background(
             homography_rendered_img,
@@ -1079,15 +1264,22 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
             depth,
             label_offset=LABEL_OFFSET,
         )
-        return composed_img, composed_mask, composed_label, homography_rendered_img, homography_rendered_mask, unoccluded_annot_ids
+        return (
+            composed_img,
+            composed_mask,
+            composed_label,
+            homography_rendered_img,
+            homography_rendered_mask,
+            unoccluded_annot_ids,
+        )
 
 
 # In[8]:
 
 
 def get_contour_bbox_area(
-        mask: Float[torch.Tensor, "n h w"],
-    ) -> tuple[list[list[list[int]]], Float[np.ndarray, "n 4"], Int64[np.ndarray, "n"]]:
+    mask: Float[torch.Tensor, "n h w"],
+) -> tuple[list[list[list[int]]], Float[np.ndarray, "n 4"], Int64[np.ndarray, " n"]]:
     if len(mask.shape) == 2:
         squeeze_needed = True
         mask = mask[None]
@@ -1117,7 +1309,9 @@ def get_contour_bbox_area(
         contours = find_contours(mask_bordered[:, :, n], 0.5)
         segm_per_img = []
         for contour in contours:  # for each connected component
-            contour = np.flip(contour, axis=1) - 1  # (B, ij) -> (B, xy), and compensate for padding
+            contour = (
+                np.flip(contour, axis=1) - 1
+            )  # (B, ij) -> (B, xy), and compensate for padding
             contour_ravel = contour.ravel().tolist()
             segm_per_img.append(contour_ravel)
         segmentations.append(segm_per_img)
@@ -1129,12 +1323,12 @@ def get_contour_bbox_area(
 
 
 def is_enough_visible(
-        visible_mask: Float[torch.Tensor, "h w"],
-        visible_area: float,
-        amodal_area: float,
-        visible_area_ratio_thresh: float = 0.05,
-        border_area_ratio_thresh: float = 0.25,
-    ):
+    visible_mask: Float[torch.Tensor, "h w"],
+    visible_area: float,
+    amodal_area: float,
+    visible_area_ratio_thresh: float = 0.05,
+    border_area_ratio_thresh: float = 0.25,
+):
     # False if more than 95% are occluded
     if visible_area < amodal_area * visible_area_ratio_thresh:
         return False
@@ -1144,7 +1338,9 @@ def is_enough_visible(
     height, width = visible_mask.shape
     height_border = int(height * border_ratio)
     width_border = int(width * border_ratio)
-    visible_center_area = visible_mask[height_border:-height_border, width_border:-width_border].sum()
+    visible_center_area = visible_mask[
+        height_border:-height_border, width_border:-width_border
+    ].sum()
     if visible_center_area < visible_area * border_area_ratio_thresh:
         return False
 
@@ -1152,16 +1348,16 @@ def is_enough_visible(
 
 
 def register_composed_result(
-        coco: COCO,
-        img_id: int,
-        composed_img: Float[Tensor, "h w 3"],
-        composed_mask: Float[Tensor, "h w"],
-        composed_label: Int64[Tensor, "h w"],
-        rendered_img: Float[Tensor, "b h w 3"],
-        rendered_mask: Float[Tensor, "b h w"],
-        unoccluded_annot_ids: list[int],
-        label_offset: int = 1000,
-    ) -> tuple[list[dict[str, Any]], int]:
+    coco: COCO,
+    img_id: int,
+    composed_img: Float[Tensor, "h w 3"],
+    composed_mask: Float[Tensor, "h w"],
+    composed_label: Int64[Tensor, "h w"],
+    rendered_img: Float[Tensor, "b h w 3"],
+    rendered_mask: Float[Tensor, "b h w"],
+    unoccluded_annot_ids: list[int],
+    label_offset: int = 1000,
+) -> tuple[list[dict[str, Any]], int]:
     obj_batch, height, width, channel = rendered_img.shape
     assert channel == 3
     assert rendered_mask.shape == (obj_batch, height, width)
@@ -1169,7 +1365,7 @@ def register_composed_result(
     assert composed_mask.shape == (height, width)
     assert composed_label.shape == (height, width)
 
-    annotations = {ann['id']: ann for ann in coco.imgToAnns[img_id]}
+    annotations = {ann["id"]: ann for ann in coco.imgToAnns[img_id]}
     all_annot_ids = annotations.keys()
     new_annot_list_per_img = []
     composed_obj_num = 0
@@ -1184,44 +1380,56 @@ def register_composed_result(
         composite_id -= 1  # NOTE: the composition 'residual' labels are 1-indexed, so we need to decrement here
         assert ann_id in all_annot_ids, f"{torch.unique(composed_label)=}"
         ann = annotations[ann_id]
-        msk = (composed_label == lbl_id)
+        msk = composed_label == lbl_id
 
-        # exisiting mask
+        # existing mask
         if composite_id < 0:  # NOTE: composite_id is already decremented
             visible_segm, visible_bbox, visible_area = get_contour_bbox_area(msk)
             amodal_segm, amodal_bbox, amodal_area = ann["segmentation"], ann["bbox"], ann["area"]
             mask_type = "real_whole" if (ann_id in unoccluded_annot_ids) else "real_partial"
-            if not is_enough_visible(msk, visible_area, amodal_area,
-                                    visible_area_ratio_thresh=0.05, border_area_ratio_thresh=0.0):
+            if not is_enough_visible(
+                msk,
+                visible_area,
+                amodal_area,
+                visible_area_ratio_thresh=0.05,
+                border_area_ratio_thresh=0.0,
+            ):
                 continue
         # new mask
         else:
             visible_segm, visible_bbox, visible_area = get_contour_bbox_area(msk)
-            amodal_segm, amodal_bbox, amodal_area = get_contour_bbox_area(rendered_mask[composite_id])
+            amodal_segm, amodal_bbox, amodal_area = get_contour_bbox_area(
+                rendered_mask[composite_id]
+            )
             mask_type = "syn"
-            if not is_enough_visible(msk, visible_area, amodal_area,
-                                    visible_area_ratio_thresh=0.05, border_area_ratio_thresh=0.25):
+            if not is_enough_visible(
+                msk,
+                visible_area,
+                amodal_area,
+                visible_area_ratio_thresh=0.05,
+                border_area_ratio_thresh=0.25,
+            ):
                 continue
             composed_obj_num += 1
 
         # write down to dict
         new_ann = {
-            'amodal_bbox': amodal_bbox,
-            'amodal_segm': amodal_segm,
-            'amodal_area': amodal_area,
-            'visible_bbox': visible_bbox,
-            'visible_segm': visible_segm,
-            'visible_area': visible_area,
-            'background_objs_segm': [],
-            'occluder_segm': [],
-            'bbox': amodal_bbox,
-            'segmentation': amodal_segm,
-            'area': amodal_area,
-            'iscrowd': False,
-            'id': lbl_id,  # USE OFFSETTED ANNOT_ID AS A NEW ID!!!
-            'image_id': img_id,
-            'category_id': ann['category_id'],
-            'mask_type': mask_type,
+            "amodal_bbox": amodal_bbox,
+            "amodal_segm": amodal_segm,
+            "amodal_area": amodal_area,
+            "visible_bbox": visible_bbox,
+            "visible_segm": visible_segm,
+            "visible_area": visible_area,
+            "background_objs_segm": [],
+            "occluder_segm": [],
+            "bbox": amodal_bbox,
+            "segmentation": amodal_segm,
+            "area": amodal_area,
+            "iscrowd": False,
+            "id": lbl_id,  # USE OFFSETTED ANNOT_ID AS A NEW ID!!!
+            "image_id": img_id,
+            "category_id": ann["category_id"],
+            "mask_type": mask_type,
         }
         new_annot_list_per_img.append(new_ann)
 
@@ -1229,11 +1437,11 @@ def register_composed_result(
 
 
 def save_json(
-        img_list: list[int],
-        annot_list: list[dict[str, Any]],
-        json_outpath: str,
-        coco: COCO,
-    ):
+    img_list: list[int],
+    annot_list: list[dict[str, Any]],
+    json_outpath: str,
+    coco: COCO,
+):
     assert json_outpath.endswith(".json")
 
     # save into a json file
@@ -1247,17 +1455,18 @@ def save_json(
 
 
 def load_json(json_path: str):
-    with open(json_path, "r") as f:
+    with open(json_path) as f:
         json_data = json.load(f)
 
     img_list = json_data["images"]
     annot_list = json_data["annotations"]
     return img_list, annot_list
 
+
 # In[ ]:
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     coco_root_dir = "/media/ryotaro/ssd1/coco/"
     is_train_or_val = "train"
     image_save_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017_composed_refactered")
@@ -1271,13 +1480,20 @@ if __name__ == '__main__':
     new_annot_list = []
 
     # load json if exists (assuming the process was interrupted in the middle)
-    json_outpath = os.path.join(coco_root_dir, f"annotations/instances_{is_train_or_val}2017_kakuda_composition_labels_refactored.json")
+    json_outpath = os.path.join(
+        coco_root_dir,
+        f"annotations/instances_{is_train_or_val}2017_kakuda_composition_labels_refactored.json",
+    )
     if os.path.isfile(json_outpath):
-        dprint(f"[main] Loading {json_outpath}, assuming that the process was interrupted in the middle.")
+        dprint(
+            f"[main] Loading {json_outpath}, assuming that the process was interrupted in the middle."
+        )
         new_img_list, new_annot_list = load_json(json_outpath)
         new_img_set = {int(img_meta["id"]) for img_meta in new_img_list}
     elif os.path.isdir(image_save_dir) and os.listdir(image_save_dir):
-        print(f"[main] Manually remove {image_save_dir} first!!! (since {json_outpath} does not exist)")
+        print(
+            f"[main] Manually remove {image_save_dir} first!!! (since {json_outpath} does not exist)"
+        )
         exit()
     os.makedirs(image_save_dir, exist_ok=True)
 
@@ -1290,8 +1506,14 @@ if __name__ == '__main__':
             new_annots_per_img = []
 
             try:
-                composed_img, composed_mask, composed_label, homography_rendered_img, homography_rendered_mask, unoccluded_annot_ids = \
-                    process(img_id, img_dir, coco, seed=trial)
+                (
+                    composed_img,
+                    composed_mask,
+                    composed_label,
+                    homography_rendered_img,
+                    homography_rendered_mask,
+                    unoccluded_annot_ids,
+                ) = process(img_id, img_dir, coco, seed=trial)
             except CompositionError as e:
                 print(f"[main] {img_id}: {e}")
                 new_annots_per_img = []
@@ -1313,7 +1535,9 @@ if __name__ == '__main__':
             )
             # if no objects are composed <even though the ground is visible>, discard the image
             if composed_obj_num == 0:
-                dprint(f"\n[main] {img_id}: Composed objects are all invisible (Trial: {trial + 1}/{COMPOSITION_RETRY_NUM}).\n")
+                dprint(
+                    f"\n[main] {img_id}: Composed objects are all invisible (Trial: {trial + 1}/{COMPOSITION_RETRY_NUM}).\n"
+                )
                 new_annots_per_img = []
                 continue
             else:
