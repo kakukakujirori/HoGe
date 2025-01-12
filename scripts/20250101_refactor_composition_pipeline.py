@@ -5,7 +5,7 @@
 
 
 from typing import Any
-import glob, json, os, sys
+import glob, json, os, random, sys
 from tqdm import tqdm
 
 import cv2
@@ -20,6 +20,7 @@ import torchvision
 
 from einops import rearrange
 from geocalib import GeoCalib
+from kornia.color import rgb_to_hsv, hsv_to_rgb
 from kornia.contrib import connected_components
 from kornia.filters import box_blur, canny
 from kornia.geometry.homography import find_homography_dlt
@@ -677,6 +678,27 @@ def detect_collision_above_ground(
     return collision_ratio > collision_ratio_thresh
 
 
+def change_object_color_hsv(
+    image: Float[torch.Tensor, "b h w 3"],
+    mask: Float[torch.Tensor, "b h w"],
+    sv_max_shift: float = 0.2,
+) -> Float[torch.Tensor, "b h w 3"]:
+    batch, height, width, channel = image.shape
+    assert channel == 3
+    assert mask.shape == (batch, height, width)
+    assert 0 <= sv_max_shift <= 1
+    mask = mask.reshape(batch, height, width, 1)
+
+    hsv = rgb_to_hsv(image.permute(0,3,1,2)).permute(0,2,3,1)
+    sv_offset = (torch.rand(batch, 1, 1, 2, device=hsv.device) * 2 - 1) * sv_max_shift
+
+    hsv_trans = hsv.clone()
+    hsv_trans[..., 1:] = (hsv[:, :, :, 1:] + sv_offset)
+
+    hsv = (1 - mask) * hsv + mask * hsv_trans
+    return hsv_to_rgb(hsv.permute(0,3,1,2)).permute(0,2,3,1)
+
+
 def compose_objects_with_background(
     obj_imgs: Float[torch.Tensor, "b h w 3"],
     obj_masks: Float[torch.Tensor, "b h w"],
@@ -1041,6 +1063,9 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
         homography_rendered_mask = torch.cat(homography_rendered_mask, dim=0).reshape(obj_batch, height, width)
         homography_rendered_depth = torch.cat(homography_rendered_depth, dim=0).reshape(obj_batch, height, width)
         homography_rendered_annot_ids = torch.tensor(homography_rendered_annot_ids, dtype=torch.int64, device=device).reshape(obj_batch)
+
+        # color augmentation
+        homography_rendered_img = change_object_color_hsv(homography_rendered_img, homography_rendered_mask, sv_max_shift=0.2)
 
         composed_img, composed_mask, composed_label = compose_objects_with_background(
             homography_rendered_img,
