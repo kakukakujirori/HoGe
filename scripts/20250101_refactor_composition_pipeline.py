@@ -1469,7 +1469,7 @@ def load_json(json_path: str):
 if __name__ == "__main__":
     coco_root_dir = "/media/ryotaro/ssd1/coco/"
     is_train_or_val = "train"
-    image_save_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017_composed_refactered")
+    image_save_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017_composed_refactored")
 
     img_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017")
     coco = COCO(os.path.join(coco_root_dir, f"annotations/instances_{is_train_or_val}2017.json"))
