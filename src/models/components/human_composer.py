@@ -232,26 +232,42 @@ class HumanComposer(nn.Module):
         return predicted_semantic_map
 
     def segment_ground(
-        self, img: Float[torch.Tensor, "b 3 h w"]
+        self,
+        img: Float[torch.Tensor, "b 3 h w"],
+        labeltype: str = "ade20k",
     ) -> Float[torch.Tensor, "b 1 h w"]:
-        predicted_semantic_map = self.run_oneformer(img)
-        # In ADE20K
-        labels = torch.tensor(
-            [
-                3,  # 3 => floor
-                6,  # 6 => road, route
-                9,  # 9 => grass
-                11,  # 11 => sidewalk, pavement
-                13,  # 13 => earth, ground
-                28,  # 28 => rug
-                53,  # 53 => stairs
-                59,  # 59 => stairway, staircase
-                96,  # 96 => escalator, moving staircase, moving stairway
-                121,  # 121 => step, stair
-            ],
-            dtype=predicted_semantic_map.dtype,
-            device=predicted_semantic_map.device,
-        )
+        if labeltype == "ade20k":
+            predicted_semantic_map = self.run_oneformer(img)
+            # In ADE20K
+            labels = torch.tensor(
+                [
+                    3,  # 3 => floor
+                    6,  # 6 => road, route
+                    9,  # 9 => grass
+                    11,  # 11 => sidewalk, pavement
+                    13,  # 13 => earth, ground
+                    28,  # 28 => rug
+                    46,  # 46 => sand  #######################################################################
+                    53,  # 53 => stairs
+                    59,  # 59 => stairway, staircase
+                    96,  # 96 => escalator, moving staircase, moving stairway
+                    121,  # 121 => step, stair
+                ],
+                dtype=predicted_semantic_map.dtype,
+                device=predicted_semantic_map.device,
+            )
+        elif labeltype == "coco":
+            predicted_semantic_map = self.run_oneformer(img)
+            # In COCO
+            raise NotImplementedError("Under construction!!!")
+            labels = torch.tensor(
+                [],
+                dtype=predicted_semantic_map.dtype,
+                device=predicted_semantic_map.device,
+            )
+        else:
+            raise NotImplementedError(f"Invalid {labeltype=}")
+
         ground_mask = torch.isin(predicted_semantic_map, labels)
         return ground_mask.float()
 
@@ -377,7 +393,7 @@ class HumanComposer(nn.Module):
         pad_w = input_size[1] - w
         pad_h_half = pad_h // 2
         pad_w_half = pad_w // 2
-        assert pad_h == 0 or pad_w == 0
+        # assert pad_h == 0 or pad_w == 0
         if pad_h == 0 and pad_w > 0:
             img_padded[:, :, :, pad_w_half : -(pad_w - pad_w_half)] = img_resized
         elif pad_h > 0 and pad_w == 0:
@@ -449,18 +465,17 @@ class HumanComposer(nn.Module):
             mask_horizontal_idx, weights=mask_horizontal_px
         ) / torch.bincount(mask_horizontal_idx)
 
-        foot_pos_in_fg = torch.stack([foot_pos_in_fg_y, foot_pos_in_fg_x], dim=-1)
+        if index == "ij":
+            foot_pos_in_fg = torch.stack([foot_pos_in_fg_y, foot_pos_in_fg_x], dim=-1)
+        elif index == "xy":
+            foot_pos_in_fg = torch.stack([foot_pos_in_fg_x, foot_pos_in_fg_y], dim=-1)
+        else:
+            raise ValueError(f"Invalid {index=}")
+        assert foot_pos_in_fg.shape == (batch, 2)
+
         current_human_pixel_height = torch.sum(
             human_mask_vertical.reshape(batch, height), dim=1
         )  # NOTE: Should be more sophisticated
-        assert foot_pos_in_fg.shape == (batch, 2)
-
-        if index == "ij":
-            pass
-        elif index == "xy":
-            foot_pos_in_fg = torch.flip(foot_pos_in_fg, dims=(1,))
-        else:
-            raise ValueError(f"Invalid {index=}")
 
         return foot_pos_in_fg.to(human_mask.dtype), current_human_pixel_height
 
@@ -789,6 +804,14 @@ class HumanComposer(nn.Module):
             # https://stackoverflow.com/questions/38754668/plane-fitting-in-a-3d-point-cloud
             # https://scipy.github.io/old-wiki/pages/Cookbook/RANSAC
             pa, pb, pc, pd = best_fitting_plane(ground_points.unsqueeze(0), equation=True)
+
+            # make pb always positive
+            pb_sign = torch.sign(pb)
+            pa = pa * pb_sign
+            pb = pb * pb_sign
+            pc = pc * pb_sign
+            pd = pd * pb_sign
+
             g_normal = F.normalize(
                 torch.tensor([pa, pb, pc], dtype=pa.dtype, device=pa.device), dim=0
             )

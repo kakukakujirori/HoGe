@@ -1,0 +1,23 @@
+_target_: src.data.mesh_datamodule.MeshDataModule
+train_original_image_dir: /media/ryotaro/ssd1/coco/train2017
+train_composite_image_dir: /media/ryotaro/ssd1/coco/train2017_composed_with_depth
+train_annot_json: /media/ryotaro/ssd1/coco/annotations/instances_train2017_kakuda_composition_labels_with_depth.json
+val_original_image_dir: /media/ryotaro/ssd1/coco/val2017
+val_composite_image_dir: /media/ryotaro/ssd1/coco/val2017_composed_with_depth
+val_annot_json: /media/ryotaro/ssd1/coco/annotations/instances_val2017_kakuda_composition_labels_with_depth.json
+test_original_image_dir: /media/ryotaro/ssd1/coco/val2017
+test_composite_image_dir: /media/ryotaro/ssd1/coco/val2017_composed_with_depth
+test_annot_json: /media/ryotaro/ssd1/coco/annotations/instances_val2017_kakuda_composition_labels_with_depth.json
+longer_image_edge_size: 512
+augmentation_list:
+  - _target_: albumentations.ColorJitter
+    brightness: [0.8, 1.2]
+    contrast: [0.8, 1.2]
+    saturation: [0.8, 1.2]
+    hue: [-0.0, 0.0]
+  - _target_: albumentations.GaussianBlur
+    blur_limit: [3, 7]
+  - _target_: albumentations.ImageCompression
+batch_size: 8 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+num_workers: 8
+pin_memory: True

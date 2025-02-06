@@ -61,11 +61,9 @@ class RenderMesh(torch.nn.Module):
         cameras: PerspectiveCameras,
     ) -> tuple[Float[torch.Tensor, "b h w layer_num 4"], Float[torch.Tensor, "b h w layer_num"]]:
 
-        image_size_list = [texture.shape[:2] for texture in meshes.textures.maps_list()]
-
         # Assuming you already have your mesh, cameras, etc. set up
         raster_settings = RasterizationSettings(
-            image_size=image_size_list[0],
+            image_size=tuple(cameras.image_size[0].long().cpu().numpy().tolist()),
             blur_radius=1e-12,
             faces_per_pixel=self.faces_per_pixel,
             bin_size=None,

@@ -1,14 +1,9 @@
-#!/usr/bin/env python
-
-# In[1]:
-
-
 import glob
 import json
 import os
 import random
 import sys
-from typing import Any
+from typing import Any, Optional
 
 import cv2
 import depth_pro
@@ -47,7 +42,7 @@ from geocalib import GeoCalib
 sys.path.append("../")
 from third_party.MoGe.moge.model import MoGeModel
 
-device = "cuda:0"
+device = "cuda:1"
 
 # DepthPro
 depthpro_cfg = depth_pro.depth_pro.DEFAULT_MONODEPTH_CONFIG_DICT
@@ -460,7 +455,6 @@ def denoise_disconnected_obj_points(
     remove_isolated_components: bool = True,
     apply_closing: bool = True,
 ) -> Float[Tensor, "b h w"]:
-    # https://github.com/facebookresearch/pytorch3d/issues/511#issuecomment-1152970392
     obj_batch, height, width = obj_masks.shape
     assert obj_points.shape == (height, width, 3) or obj_points.shape == (
         obj_batch,
@@ -1271,6 +1265,8 @@ def process(img_id: int, img_dir: str, coco: COCO, seed: int = 0):
             composed_label,
             homography_rendered_img,
             homography_rendered_mask,
+            homography_rendered_depth,
+            depth,
             unoccluded_annot_ids,
         )
 
@@ -1356,9 +1352,12 @@ def register_composed_result(
     composed_label: Int64[Tensor, "h w"],
     rendered_img: Float[Tensor, "b h w 3"],
     rendered_mask: Float[Tensor, "b h w"],
+    rendered_depth: Float[Tensor, "b h w"],
     unoccluded_annot_ids: list[int],
     label_offset: int = 1000,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[
+    list[dict[str, Any]], dict[int, Optional[np.ndarray]], dict[int, Optional[np.ndarray]], int
+]:
     obj_batch, height, width, channel = rendered_img.shape
     assert channel == 3
     assert rendered_mask.shape == (obj_batch, height, width)
@@ -1369,6 +1368,8 @@ def register_composed_result(
     annotations = {ann["id"]: ann for ann in coco.imgToAnns[img_id]}
     all_annot_ids = annotations.keys()
     new_annot_list_per_img = []
+    new_rgb_dict_per_img = {}
+    new_depth_dict_per_img = {}
     composed_obj_num = 0
 
     for lbl_id in torch.unique(composed_label):
@@ -1396,6 +1397,9 @@ def register_composed_result(
                 border_area_ratio_thresh=0.0,
             ):
                 continue
+            amodal_rgb = None
+            amodal_depth = None
+
         # new mask
         else:
             visible_segm, visible_bbox, visible_area = get_contour_bbox_area(msk)
@@ -1411,6 +1415,12 @@ def register_composed_result(
                 border_area_ratio_thresh=0.25,
             ):
                 continue
+            sx, sy, w, h = amodal_bbox
+            sx, sy, tx, ty = int(sx), int(sy), int(sx + w), int(sy + h)
+            amodal_rgb = rendered_img[composite_id, sy:ty, sx:tx].cpu().numpy()
+            amodal_depth = rendered_depth[composite_id, sy:ty, sx:tx].cpu().numpy()
+            assert amodal_rgb.shape == (h, w, 3), f"{amodal_rgb.shape=}, {amodal_bbox=}"
+            assert amodal_depth.shape == (h, w), f"{amodal_depth.shape=}, {amodal_bbox=}"
             composed_obj_num += 1
 
         # write down to dict
@@ -1433,8 +1443,10 @@ def register_composed_result(
             "mask_type": mask_type,
         }
         new_annot_list_per_img.append(new_ann)
+        new_rgb_dict_per_img[lbl_id] = amodal_rgb
+        new_depth_dict_per_img[lbl_id] = amodal_depth
 
-    return new_annot_list_per_img, composed_obj_num
+    return new_annot_list_per_img, new_rgb_dict_per_img, new_depth_dict_per_img, composed_obj_num
 
 
 def save_json(
@@ -1464,13 +1476,23 @@ def load_json(json_path: str):
     return img_list, annot_list
 
 
-# In[ ]:
+def save_depth(depth_outpath: str, depth: Float[np.ndarray | Tensor, "h w"]):
+    assert depth_outpath.endswith(".npy")
+    assert len(depth.shape) == 2
+    if isinstance(depth, torch.Tensor):
+        depth = depth.cpu().numpy()
+    np.save(depth_outpath, depth.astype(np.float16))
 
 
 if __name__ == "__main__":
     coco_root_dir = "/media/ryotaro/ssd1/coco/"
     is_train_or_val = "train"
-    image_save_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017_composed_refactored")
+    image_save_dir = os.path.join(
+        coco_root_dir, f"{is_train_or_val}2017_composed_with_depth/image"
+    )
+    depth_save_dir = os.path.join(
+        coco_root_dir, f"{is_train_or_val}2017_composed_with_depth/depth"
+    )
 
     img_dir = os.path.join(coco_root_dir, f"{is_train_or_val}2017")
     coco = COCO(os.path.join(coco_root_dir, f"annotations/instances_{is_train_or_val}2017.json"))
@@ -1483,7 +1505,7 @@ if __name__ == "__main__":
     # load json if exists (assuming the process was interrupted in the middle)
     json_outpath = os.path.join(
         coco_root_dir,
-        f"annotations/instances_{is_train_or_val}2017_kakuda_composition_labels_refactored.json",
+        f"annotations/instances_{is_train_or_val}2017_kakuda_composition_labels_with_depth.json",
     )
     if os.path.isfile(json_outpath):
         dprint(
@@ -1497,6 +1519,7 @@ if __name__ == "__main__":
         )
         exit()
     os.makedirs(image_save_dir, exist_ok=True)
+    os.makedirs(depth_save_dir, exist_ok=True)
 
     for img_id in tqdm(coco.getImgIds()):
         if img_id in new_img_set:
@@ -1513,6 +1536,8 @@ if __name__ == "__main__":
                     composed_label,
                     homography_rendered_img,
                     homography_rendered_mask,
+                    homography_rendered_depth,
+                    depth,
                     unoccluded_annot_ids,
                 ) = process(img_id, img_dir, coco, seed=trial)
             except CompositionError as e:
@@ -1523,16 +1548,19 @@ if __name__ == "__main__":
                 raise Exception(img_id, e)
 
             # register
-            new_annots_per_img, composed_obj_num = register_composed_result(
-                coco,
-                img_id,
-                composed_img,
-                composed_mask,
-                composed_label,
-                homography_rendered_img,
-                homography_rendered_mask,
-                unoccluded_annot_ids,
-                label_offset=LABEL_OFFSET,
+            new_annots_per_img, new_rgbs_per_img, new_depths_per_img, composed_obj_num = (
+                register_composed_result(
+                    coco,
+                    img_id,
+                    composed_img,
+                    composed_mask,
+                    composed_label,
+                    homography_rendered_img,
+                    homography_rendered_mask,
+                    homography_rendered_depth,
+                    unoccluded_annot_ids,
+                    label_offset=LABEL_OFFSET,
+                )
             )
             # if no objects are composed <even though the ground is visible>, discard the image
             if composed_obj_num == 0:
@@ -1547,13 +1575,31 @@ if __name__ == "__main__":
         if new_annots_per_img:
             new_annot_list.extend(new_annots_per_img)
 
-            # save the image (NOTE: amodal texture is so far not saved!!!)
+            # save the background image (NOTE: amodal texture is so far not saved!!!)
             image_save_path = os.path.join(image_save_dir, coco.imgs[img_id]["file_name"])
             ret_uint8 = np.clip(255 * composed_img.cpu().numpy(), 0, 255).astype(np.uint8)
             cv2.imwrite(image_save_path, ret_uint8[:, :, ::-1])
             new_img_list.append(coco.imgs[img_id])
             new_img_set.add(img_id)
             dprint(f"\n{img_id}: saved! (Composed object num: {composed_obj_num})\n")
+
+            # save the background depth
+            depth_save_path = os.path.join(
+                depth_save_dir,
+                coco.imgs[img_id]["file_name"].replace(".jpg", ".npy").replace(".png", ".npy"),
+            )
+            save_depth(depth_save_path, depth)
+
+            # save the object image
+            for annot_id, rgb in new_rgbs_per_img.items():
+                if rgb is not None:
+                    cv2.imwrite(
+                        os.path.join(image_save_dir, f"{annot_id}.jpg"),
+                        np.clip(255 * rgb, 0, 255).astype(np.uint8)[:, :, ::-1],
+                    )
+            for annot_id, dep in new_depths_per_img.items():
+                if dep is not None:
+                    save_depth(os.path.join(depth_save_dir, f"{annot_id}.npy"), dep)
 
         if new_img_list and len(new_img_list) % JSON_SAVE_FREQ == 0:
             save_json(new_img_list, new_annot_list, json_outpath, coco)

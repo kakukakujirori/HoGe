@@ -924,6 +924,14 @@ class HumanComposer3D(nn.Module):
             # https://stackoverflow.com/questions/38754668/plane-fitting-in-a-3d-point-cloud
             # https://scipy.github.io/old-wiki/pages/Cookbook/RANSAC
             pa, pb, pc, pd = best_fitting_plane(ground_points.unsqueeze(0), equation=True)
+
+            # make pb always positive
+            pb_sign = torch.sign(pb)
+            pa = pa * pb_sign
+            pb = pb * pb_sign
+            pc = pc * pb_sign
+            pd = pd * pb_sign
+
             g_normal = F.normalize(
                 torch.tensor([pa, pb, pc], dtype=pa.dtype, device=pa.device), dim=0
             )
