@@ -49,7 +49,7 @@ class MeshDataset(Dataset):
         sx: int,
         ty: int,
         tx: int,
-    ) -> Float[np.ndarray, "h w"]:
+    ) -> Float[np.ndarray, "h w 3"]:
         y, x = np.meshgrid(
             np.arange(sy, ty, dtype=depth.dtype),
             np.arange(sx, tx, dtype=depth.dtype),
@@ -150,12 +150,9 @@ class MeshDataset(Dataset):
             masks_list.append(obj_mask)
 
         # convert to mesh components
-        valid_alpha = 1.0
-        invalid_alpha = -1.0
         faces_list = []
         verts_list = []
         verts_uv_list = []
-        colors_alpha_list = []
         for pts, colors, mask in zip(points_list, colors_list, masks_list):
             height, width = mask.shape
             assert pts.shape == (height, width, 3)
@@ -164,26 +161,23 @@ class MeshDataset(Dataset):
             # some data is saved as uint8
             mask = mask.astype(bool)
 
-            alphamap = np.full((height, width, 1), fill_value=valid_alpha)
-            alphamap[~mask, :] = invalid_alpha
-            colors_alpha = np.concatenate([colors, alphamap], axis=-1)
-
             faces, vertices, vertex_colors, vertex_uvs = utils3d.numpy.image_mesh(
                 pts,
-                colors_alpha,
+                colors,
                 utils3d.numpy.image_uv(width=width, height=height),
-                mask=None,
+                mask=mask,
                 tri=True,
             )
             vertex_uvs[:, 1] = 1 - vertex_uvs[:, 1]
             faces_list.append(torch.from_numpy(faces))
             verts_list.append(torch.from_numpy(vertices))
             verts_uv_list.append(torch.from_numpy(vertex_uvs).float())
-            colors_alpha_list.append(torch.from_numpy(colors_alpha).float())
+
+        colors_list = [torch.from_numpy(colors).float() for colors in colors_list]
 
         # Create a textures object
         tex_list = TexturesUV(
-            maps=colors_alpha_list,
+            maps=colors_list,
             faces_uvs=faces_list,
             verts_uvs=verts_uv_list,
             align_corners=False,

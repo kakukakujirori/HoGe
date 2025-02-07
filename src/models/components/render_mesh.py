@@ -22,13 +22,15 @@ from pytorch3d.structures import Meshes
 # https://github.com/facebookresearch/pytorch3d/issues/737
 class VoidFillShader(torch.nn.Module):
     def __init__(
-        self, void_color: tuple[float, float, float] = (0.0, 0.0, 0.0), void_alpha: float = 0.0
+        self,
+        void_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        void_alpha: Optional[float] = 0.0,
     ):
         super().__init__()
         assert len(void_color) == 3
         assert 0 <= min(void_color) and max(void_color) <= 1.0
         self.blend_params = BlendParams(
-            background_color=(*void_color, void_alpha)
+            background_color=(*void_color, void_alpha) if void_alpha is not None else void_color
         )  # the last 0.0 means 'invalid'
 
     def forward(self, fragments: Fragments, meshes: Meshes, **kwargs) -> torch.Tensor:
@@ -49,7 +51,7 @@ class VoidFillShader(torch.nn.Module):
 
 
 class RenderMesh(torch.nn.Module):
-    def __init__(self, layer_num: int = 3, void_alpha: float = 0.0):
+    def __init__(self, layer_num: int = 3, void_alpha: Optional[float] = 0.0):
         super().__init__()
         self.layer_num = layer_num
         self.faces_per_pixel = layer_num * 2
@@ -178,6 +180,10 @@ class RenderMesh(torch.nn.Module):
         cameras: PerspectiveCameras,
     ) -> tuple[Float[torch.Tensor, "b h w layers 4"], Float[torch.Tensor, "b h w layers"]]:
         texels, depths = self.render(meshes, cameras)
-        texels, depths = self.cull_redundant_layers(texels, depths)
-        depths[texels[..., 3] < 0.5] = -1  # mask invalid depth as well
+        if self.void_alpha is not None:
+            texels, depths = self.cull_redundant_layers(texels, depths)
+            depths[texels[..., 3] < 0.5] = -1  # mask invalid depth as well
+        else:
+            texels = texels[..., : self.layer_num, :]
+            depths = depths[..., : self.layer_num]
         return texels, depths

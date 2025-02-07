@@ -43,7 +43,9 @@ class OptimalAlignmentLoss(torch.nn.Module):
 
         batch, height, width, layers, channel = input_points_gathered.shape
         assert channel == 3
-        assert input_points_gathered.shape == output_points.shape
+        assert (
+            input_points_gathered.shape == output_points.shape
+        ), f"{input_points_gathered.shape=}, {output_points.shape=}"
         assert (batch, height, width) == input_masks.shape
 
         # optimal scale and shift are determined from the first layer results

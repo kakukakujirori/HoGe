@@ -68,7 +68,7 @@ class MeshHoGeModule(LightningModule):
         # also ensures init params will be stored in ckpt
         self.save_hyperparameters(ignore=["net"], logger=False)
 
-        self.mesh_renderer = RenderMesh(layer_num=net.max_points_per_ray, void_alpha=0.0)
+        self.mesh_renderer = RenderMesh(layer_num=net.max_points_per_ray, void_alpha=None)
 
         # load MoGe weight
         self.net = net
@@ -116,7 +116,9 @@ class MeshHoGeModule(LightningModule):
         camera = PerspectiveCameras(
             focal_length=focal_len.reshape(batch, 1).float(),
             principal_point=torch.tensor([width / 2, height / 2]).reshape(1, 2).expand(batch, -1),
-            R=torch.diag(torch.tensor([-1, -1, 1], device=image.device)).reshape(1, 3, 3).expand(batch, -1, -1),
+            R=torch.diag(torch.tensor([-1, -1, 1], device=image.device))
+            .reshape(1, 3, 3)
+            .expand(batch, -1, -1),
             T=torch.zeros(batch, 3, device=image.device),
             device=image.device,
             in_ndc=False,
@@ -128,7 +130,16 @@ class MeshHoGeModule(LightningModule):
 
             texels_rendered, depths_rendered = self.mesh_renderer(
                 meshes, camera
-            )  # (b, h, w, layers, 4), (b, h, w, layers)
+            )  # (b, h, w, layers, 3), (b, h, w, layers)
+
+            # add alpha channel
+            texels_rendered = torch.cat(
+                [
+                    texels_rendered,
+                    (depths_rendered.isfinite() * (depths_rendered > 0)).float().unsqueeze(-1),
+                ],
+                dim=-1,
+            )
 
             # unproject depths_rendered to points_rendered
             uv_coord = utils3d.torch.image_uv(
@@ -176,9 +187,7 @@ class MeshHoGeModule(LightningModule):
         # HoGe inference
         output_dict = self.forward(
             image=rearrange(composite_image, "b h w c -> b c h w"),
-            invalid_mask=torch.zeros(
-                (b, 1, h, w), dtype=torch.bool, device=composite_image.device
-            ),  # NOTE: sky region is 'valid' here
+            invalid_mask=None,  # NOTE: sky region is 'valid' here
         )
 
         # calculate losses
